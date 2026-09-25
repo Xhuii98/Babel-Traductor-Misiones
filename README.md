@@ -11,6 +11,7 @@ Traduce los libros de misiones de tus modpacks de Minecraft al español (o a otr
 - Encuentra solo las misiones del modpack que elijas y las traduce.
 - Protege lo que no debe tocarse: identificadores, dependencias entre misiones, nombres de objetos, códigos de color y enlaces.
 - Instala la traducción en el modpack y guarda el archivo original como `.respaldo`.
+- Respeta los términos que los jugadores usan en inglés, como *mobs*, *spawn*, *crafting*, *boss*, *XP*, el *Nether* o el *End*, y en español traduce siempre *chest* como «cofre».
 - Recuerda lo que ya tradujo, así que volver a correrla es casi instantáneo y no gasta cuota.
 - Si parte del texto vive dentro de un mod (`.jar`), crea y activa un paquete de recursos con la traducción.
 

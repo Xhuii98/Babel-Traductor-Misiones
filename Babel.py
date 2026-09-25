@@ -31,7 +31,7 @@ except ImportError as e:
     messagebox.showerror("Falta una librería", f"{e}\n\nEscribe en tu consola (cmd):\npython -m pip install customtkinter")
     sys.exit()
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 NOMBRE_APP = "Babel"
 RUTA_SALIDA_FIJA = os.path.join(os.path.expanduser("~"), "Documents", NOMBRE_APP)
 _RUTA_ANTIGUA = os.path.join(os.path.expanduser("~"), "Documents", "FTB_Translator")
@@ -663,6 +663,78 @@ def extraer_textos(contenido, modo_lang=False):
     return textos
 
 
+GLOSARIO_FIJO = r"(?i:mobs?|spawners?|respawns?|spawns?|crafting|stacks?|bosses|boss|xp|buffs?|debuffs?|nerfs?)"
+GLOSARIO_NOMBRES = (r"Ender Dragon|Endermen|Enderman|Overworld|Netherite|Nether|Redstone|Elytra|Wither|Warden|"
+                    r"Creepers?|Piglins?|Blazes?|Ghasts?|Shulkers?")
+GLOSARIO_ES = {"chest": "cofre", "chests": "cofres"}
+RE_GLOSARIO = re.compile(r"\b(?:" + GLOSARIO_FIJO + "|" + GLOSARIO_NOMBRES + r")\b|(?<![.!?:]\s)(?<!^)\bEnd\b")
+RE_GLOSARIO_ES = re.compile(r"\b(?i:chests?)\b")
+RE_FICHA = re.compile(r"QX(\d+)Z", re.IGNORECASE)
+
+
+def regex_glosario(idioma):
+    if idioma.startswith("es"):
+        return re.compile(RE_GLOSARIO.pattern + "|" + RE_GLOSARIO_ES.pattern)
+    return RE_GLOSARIO
+
+
+def forma_glosario(termino, idioma):
+    fija = GLOSARIO_ES.get(termino.lower()) if idioma.startswith("es") else None
+    if not fija:
+        return termino
+    return fija[0].upper() + fija[1:] if termino[0].isupper() else fija
+
+
+def enmascarar(txt, idioma):
+    terminos = []
+
+    def ficha(m):
+        terminos.append(forma_glosario(m.group(0), idioma))
+        return f"QX{len(terminos) - 1}Z"
+
+    return regex_glosario(idioma).sub(ficha, txt), terminos
+
+
+def desenmascarar(tr, terminos):
+    if not terminos:
+        return tr
+    vistas = [int(n) for n in RE_FICHA.findall(tr)]
+    if sorted(vistas) != list(range(len(terminos))):
+        return None
+    return RE_FICHA.sub(lambda m: terminos[int(m.group(1))], tr)
+
+
+def cache_respeta_glosario(txt, tr, idioma):
+    for m in regex_glosario(idioma).finditer(txt):
+        if forma_glosario(m.group(0), idioma).lower() not in tr.lower():
+            return False
+    return True
+
+
+def rearmar_por_piezas(txt, traductor, idioma):
+    rx = regex_glosario(idioma)
+    piezas, pos = [], 0
+    for m in rx.finditer(txt):
+        piezas.append((False, txt[pos:m.start()]))
+        piezas.append((True, forma_glosario(m.group(0), idioma)))
+        pos = m.end()
+    piezas.append((False, txt[pos:]))
+    a_traducir = [p.strip() for es_term, p in piezas if not es_term and tiene_letras(p)]
+    if not a_traducir:
+        return "".join(p for _, p in piezas)
+    resultados = traductor.traducir_lote(a_traducir)
+    tr = {orig: r for orig, (r, _) in zip(a_traducir, resultados)}
+    if any(not tr.get(t) for t in a_traducir):
+        return None
+    salida = ""
+    for es_term, p in piezas:
+        if es_term or not tiene_letras(p):
+            salida += p
+        else:
+            salida += p[:len(p) - len(p.lstrip())] + tr[p.strip()] + p[len(p.rstrip()):]
+    return salida
+
+
 def dividir_en_lotes(textos):
     lotes, actual, chars = [], [], 0
     for t in textos:
@@ -680,7 +752,7 @@ def resolver_textos(textos, traductor, idioma, nombre, indice, total):
     mapa, pendientes = {}, []
     for txt in textos:
         previa = MEMORIA_GLOBAL.get(f"{idioma}|{txt}")
-        if previa:
+        if previa and cache_respeta_glosario(txt, previa, idioma):
             mapa[txt] = previa
             ESTADO["cache"] += 1
         else:
@@ -691,10 +763,20 @@ def resolver_textos(textos, traductor, idioma, nombre, indice, total):
     fallidas, hechos = 0, 0
     lotes = dividir_en_lotes(pendientes)
     for n, lote in enumerate(lotes, 1):
-        resultados = traductor.traducir_lote(lote)
-        for txt, (tr, motor) in zip(lote, resultados):
+        mascaras = [enmascarar(t, idioma) for t in lote]
+        resultados = traductor.traducir_lote([m for m, _ in mascaras])
+        for txt, (_, terminos), (tr, motor) in zip(lote, mascaras, resultados):
             if tr and es_respuesta_invalida(tr) and not es_respuesta_invalida(txt):
                 tr = None
+            if tr and terminos:
+                tr = desenmascarar(tr, terminos)
+                if tr is None:
+                    try:
+                        tr = rearmar_por_piezas(txt, traductor, idioma)
+                    except TodosBloqueados:
+                        raise
+                    except Exception:
+                        tr = None
             if tr:
                 mapa[txt] = tr
                 MEMORIA_GLOBAL[f"{idioma}|{txt}"] = tr

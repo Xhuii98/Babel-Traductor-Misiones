@@ -31,12 +31,11 @@ Funciona igual con Forge, NeoForge, Fabric y Quilt. Probado principalmente con m
 1. Ve a **[Releases](../../releases)** y descarga `Babel_portable.zip`.
 2. Descomprímelo donde quieras (no necesita instalación).
 3. Abre `Babel.exe`.
-4. Elige la carpeta del modpack. En CurseForge: clic derecho en el modpack → **Open Folder**.
-5. Elige la carpeta del modpack:
+4. Elige la carpeta del modpack:
    - En CurseForge, haz clic derecho en el modpack → **Open Folder** (Abrir carpeta).
    - En la ventana que se abre, haz clic en la barra de direcciones de arriba y copia la ruta (Ctrl+C).
    - Pégala en el campo **Carpeta del modpack** de Babel (Ctrl+V). También puedes pulsar **Examinar** y buscar la carpeta.
-6. Elige el idioma y pulsa **Traducir**.
+5. Elige el idioma y pulsa **Traducir**.
 
 Cierra el juego antes de traducir. Al terminar, abre el juego y listo.
 

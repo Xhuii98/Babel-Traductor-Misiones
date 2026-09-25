@@ -1,0 +1,3 @@
+customtkinter
+deep-translator
+requests

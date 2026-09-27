@@ -46,7 +46,7 @@ La app usa el primero que esté disponible:
 
 1. **DeepL** (recomendado, la mejor calidad). Crea una cuenta gratis en [deepl.com/pro-api](https://www.deepl.com/pro-api) y pega tu clave. Da 500 000 caracteres al mes.
 2. **LibreTranslate** (opcional, en tu PC, sin límites). Ver abajo.
-3. **Google Translate** (sin configurar nada). Alcanza para uno o dos modpacks; si traduces muchos seguidos, Google puede bloquearte por unas horas.
+3. **Microsoft Translator y Google Translate** (sin configurar nada). Funcionan solos, sin clave, y trabajan al mismo tiempo; si uno te bloquea, el otro sigue. Si traduces muchos modpacks seguidos, pueden pedirte un descanso de unas horas.
 
 ### LibreTranslate en tu computadora (opcional)
 

@@ -31,7 +31,7 @@ except ImportError as e:
     messagebox.showerror("Falta una librería", f"{e}\n\nEscribe en tu consola (cmd):\npython -m pip install customtkinter")
     sys.exit()
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 NOMBRE_APP = "Babel"
 RUTA_SALIDA_FIJA = os.path.join(os.path.expanduser("~"), "Documents", NOMBRE_APP)
 _RUTA_ANTIGUA = os.path.join(os.path.expanduser("~"), "Documents", "FTB_Translator")
@@ -244,6 +244,67 @@ def traducir_google_lote(textos, destino):
     return salida
 
 
+MS_URL = "https://edge.microsoft.com/translate/translatetext"
+MS_CODIGOS = {"pt-PT": "pt-pt", "zh-CN": "zh-Hans", "zh-TW": "zh-Hant", "no": "nb"}
+MS_LOTE_TEXTOS = 50
+MS_LOTE_CARACTERES = 5000
+MS_INTERVALO = 0.6
+_ms_lock = threading.Lock()
+_ms_ultimo = [0.0]
+
+
+def codigo_microsoft(lang):
+    return MS_CODIGOS.get(lang["id"]) or lang["google"].split("-")[0]
+
+
+def _ms_texto(item):
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        if isinstance(item.get("translations"), list) and item["translations"]:
+            return item["translations"][0].get("text")
+        return item.get("text")
+    return None
+
+
+def _ms_peticion(textos, destino):
+    with _ms_lock:
+        espera = MS_INTERVALO - (time.time() - _ms_ultimo[0])
+        if espera > 0:
+            time.sleep(espera)
+        _ms_ultimo[0] = time.time()
+    params = {"to": destino, "isEnterpriseClient": "false"}
+    if destino != "en":
+        params["from"] = "en"
+    r = requests.post(MS_URL, params=params, json=list(textos), headers=GOOGLE_CABECERAS, timeout=30)
+    if r.status_code == 429:
+        raise RuntimeError("429 Microsoft: TooManyRequests")
+    if r.status_code != 200:
+        raise RuntimeError(f"Microsoft HTTP {r.status_code}")
+    datos = r.json()
+    if not isinstance(datos, list) or len(datos) != len(textos):
+        raise RuntimeError("Microsoft: respuesta inesperada")
+    return [_ms_texto(x) for x in datos]
+
+
+def traducir_microsoft_lote(textos, destino):
+    salida, grupo, chars = [None] * len(textos), [], 0
+
+    def enviar(idx):
+        if idx:
+            for i, t in zip(idx, _ms_peticion([textos[i] for i in idx], destino)):
+                salida[i] = t
+
+    for i, t in enumerate(textos):
+        if grupo and (len(grupo) >= MS_LOTE_TEXTOS or chars + len(t) > MS_LOTE_CARACTERES):
+            enviar(grupo)
+            grupo, chars = [], 0
+        grupo.append(i)
+        chars += len(t)
+    enviar(grupo)
+    return salida
+
+
 def clasificar(exc):
     nombre = type(exc).__name__.lower()
     msg = str(exc).lower()
@@ -408,6 +469,9 @@ class Traductor:
         self.motores.append(Motor("LibreTranslate", lambda t: self._libre([t])[0], 0.0))
         if api_deepl:
             self.motores.append(Motor("DeepL", lambda t: traducir_deepl(t, api_deepl, lang["deepl"]), 0.1))
+        ms = codigo_microsoft(lang)
+        self.motores.append(Motor("Microsoft", lambda t: traducir_microsoft_lote([t], ms)[0], 0.0))
+        self.lote_microsoft = lambda ts: traducir_microsoft_lote(ts, ms)
         self.motores.append(Motor("Google", lambda t: traducir_google_lote([t], lang["google"])[0], 0.0))
         self.lote_google = lambda ts: traducir_google_lote(ts, lang["google"])
         self.lote_deepl = (lambda ts: traducir_deepl_lote(ts, api_deepl, lang["deepl"])) if api_deepl else None
@@ -502,10 +566,11 @@ class Traductor:
 
     def _repartir(self, textos, resultados, indices):
         plan = []
-        for nombre, tam in (("LibreTranslate", 20), ("Google", 30)):
+        fns = {"LibreTranslate": self._libre, "Microsoft": self.lote_microsoft, "Google": self.lote_google}
+        for nombre, tam in (("LibreTranslate", 20), ("Microsoft", 50), ("Google", 30)):
             m = self.motor(nombre)
             if m and m.disponible():
-                fn = self._libre if nombre == "LibreTranslate" else self.lote_google
+                fn = fns[nombre]
                 plan.append((m, tam, fn))
         if not plan:
             return
@@ -1351,7 +1416,7 @@ def iniciar_proceso(ruta_entrada, lang, api_deepl, instalar=False, incluir_todo=
                 usados, limite = uso
                 log(f"📈 DeepL: {usados:,} de {limite:,} caracteres usados este mes")
                 if caracteres > limite - usados:
-                    log("⚠️ Puede que no alcance la cuota de DeepL; el resto pasará a LibreTranslate/Google.")
+                    log("⚠️ Puede que no alcance la cuota de DeepL; el resto pasará a Microsoft/Google/LibreTranslate.")
 
         ruta_salida = os.path.join(RUTA_SALIDA_FIJA, "_traducido")
         raiz = raiz_instancia(ruta_entrada)
@@ -1682,7 +1747,7 @@ if __name__ == "__main__":
                     text_color=C["suave"], fg_color=C["acento"], hover_color=C["acento_hover"],
                     checkmark_color=C["texto_acento"], font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(8, 0))
 
-    c3 = tarjeta(izq, 3, "Clave de DeepL (recomendada)", "Gratis: 500 000 caracteres al mes. Sin clave usa LibreTranslate/Google")
+    c3 = tarjeta(izq, 3, "Clave de DeepL (recomendada)", "Gratis: 500 000 caracteres al mes. Sin clave usa Microsoft y Google")
     fila_api = ctk.CTkFrame(c3, fg_color="transparent")
     fila_api.pack(fill="x")
     entrada_api = ctk.CTkEntry(fila_api, height=38, show="•", placeholder_text="Pega tu clave (termina en :fx)",
@@ -1739,7 +1804,7 @@ if __name__ == "__main__":
     fila_chips.pack(fill="x", padx=18, pady=(4, 8))
     ctk.CTkLabel(fila_chips, text="Motores:", text_color=C["suave"], font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 8))
     chips = {}
-    for nombre in ("DeepL", "LibreTranslate", "Google"):
+    for nombre in ("DeepL", "LibreTranslate", "Microsoft", "Google"):
         chips[nombre] = ctk.CTkLabel(fila_chips, text=f"● {nombre}", text_color=C["suave"], font=ctk.CTkFont(size=12))
         chips[nombre].pack(side="left", padx=(0, 12))
 

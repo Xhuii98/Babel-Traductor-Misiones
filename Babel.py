@@ -31,7 +31,7 @@ except ImportError as e:
     messagebox.showerror("Falta una librería", f"{e}\n\nEscribe en tu consola (cmd):\npython -m pip install customtkinter")
     sys.exit()
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 NOMBRE_APP = "Babel"
 RUTA_SALIDA_FIJA = os.path.join(os.path.expanduser("~"), "Documents", NOMBRE_APP)
 _RUTA_ANTIGUA = os.path.join(os.path.expanduser("~"), "Documents", "FTB_Translator")
@@ -175,6 +175,73 @@ def guardar_seguro():
 
 
 MEMORIA_GLOBAL = cargar_memoria()
+
+
+GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
+GOOGLE_CABECERAS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/128.0 Safari/537.36",
+    "Accept": "*/*",
+}
+GOOGLE_LOTE_CARACTERES = 3500
+GOOGLE_INTERVALO = 1.2
+_google_lock = threading.Lock()
+_google_ultimo = [0.0]
+
+
+def _google_peticion(texto, destino):
+    with _google_lock:
+        espera = GOOGLE_INTERVALO - (time.time() - _google_ultimo[0])
+        if espera > 0:
+            time.sleep(espera)
+        _google_ultimo[0] = time.time()
+    r = requests.post(GOOGLE_URL, params={"client": "gtx", "sl": "auto", "tl": destino, "dt": "t"},
+                      data={"q": texto}, headers=GOOGLE_CABECERAS, timeout=30)
+    if r.status_code == 429:
+        raise RuntimeError("429 Google: TooManyRequests")
+    if r.status_code != 200:
+        raise RuntimeError(f"Google HTTP {r.status_code}")
+    datos = r.json()
+    return "".join(seg[0] for seg in (datos[0] or []) if seg and isinstance(seg[0], str))
+
+
+def _google_viejo(textos, destino):
+    return [GoogleTranslator(source="auto", target=destino).translate(t) for t in textos]
+
+
+def traducir_google_lote(textos, destino):
+    salida = [None] * len(textos)
+    grupo, chars = [], 0
+
+    def enviar(idx):
+        if not idx:
+            return
+        try:
+            if len(idx) == 1:
+                salida[idx[0]] = _google_peticion(textos[idx[0]], destino)
+                return
+            partes = _google_peticion("\n".join(textos[i] for i in idx), destino).split("\n")
+            if len(partes) == len(idx):
+                for i, t in zip(idx, partes):
+                    salida[i] = t.strip()
+                return
+            for i in idx:
+                salida[i] = _google_peticion(textos[i], destino)
+        except (ValueError, KeyError, IndexError, TypeError):
+            for i, t in zip(idx, _google_viejo([textos[i] for i in idx], destino)):
+                salida[i] = t
+
+    for i, t in enumerate(textos):
+        if "\n" in t:
+            enviar([i])
+            continue
+        if grupo and chars + len(t) > GOOGLE_LOTE_CARACTERES:
+            enviar(grupo)
+            grupo, chars = [], 0
+        grupo.append(i)
+        chars += len(t) + 1
+    enviar(grupo)
+    return salida
 
 
 def clasificar(exc):
@@ -341,10 +408,8 @@ class Traductor:
         self.motores.append(Motor("LibreTranslate", lambda t: self._libre([t])[0], 0.0))
         if api_deepl:
             self.motores.append(Motor("DeepL", lambda t: traducir_deepl(t, api_deepl, lang["deepl"]), 0.1))
-        self.motores.append(Motor(
-            "Google",
-            lambda t: GoogleTranslator(source="auto", target=lang["google"]).translate(t),
-            0.5))
+        self.motores.append(Motor("Google", lambda t: traducir_google_lote([t], lang["google"])[0], 0.0))
+        self.lote_google = lambda ts: traducir_google_lote(ts, lang["google"])
         self.lote_deepl = (lambda ts: traducir_deepl_lote(ts, api_deepl, lang["deepl"])) if api_deepl else None
 
     def _libre(self, textos):
@@ -437,10 +502,10 @@ class Traductor:
 
     def _repartir(self, textos, resultados, indices):
         plan = []
-        for nombre, tam in (("LibreTranslate", 20), ("Google", 1)):
+        for nombre, tam in (("LibreTranslate", 20), ("Google", 30)):
             m = self.motor(nombre)
             if m and m.disponible():
-                fn = self._libre if nombre == "LibreTranslate" else (lambda ts, m=m: [m.fn(ts[0])])
+                fn = self._libre if nombre == "LibreTranslate" else self.lote_google
                 plan.append((m, tam, fn))
         if not plan:
             return

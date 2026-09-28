@@ -31,7 +31,7 @@ except ImportError as e:
     messagebox.showerror("Falta una librería", f"{e}\n\nEscribe en tu consola (cmd):\npython -m pip install customtkinter")
     sys.exit()
 
-VERSION = "1.3.1"
+VERSION = "1.5.0"
 NOMBRE_APP = "Babel"
 RUTA_SALIDA_FIJA = os.path.join(os.path.expanduser("~"), "Documents", NOMBRE_APP)
 _RUTA_ANTIGUA = os.path.join(os.path.expanduser("~"), "Documents", "FTB_Translator")
@@ -654,6 +654,8 @@ class Traductor:
 
 def crear_regex_proteccion(lista_mods, json_mode=False):
     patron_base = r'([&§][0-9a-fA-Fk-oK-OrR])|({[^}]+})|(\((?:quest|item|image|http|https):[^)]+\))|(<[^>]+>)|(\[[a-zA-Z]+=[^\]]+\])'
+    if not json_mode:
+        patron_base += r'|((?:\\n|\ue000.)+)'
     if json_mode:
         patron_base += r'|(%(?:\d+\$)?[-+0#]*\d*(?:\.\d+)?[sdfxXeEgGcb%])|(\n)'
     if not lista_mods:
@@ -789,13 +791,70 @@ LOTE_TEXTOS = 40
 LOTE_CARACTERES = 12000
 
 
+ESCAPES_SNBT = set('\\"\'')
+
+
+MARCA_ESCAPE = "\ue000"
+
+
+def desescapar_snbt(v):
+    v = re.sub(r'(?<!\\)((?:\\\\)*)\\u([0-9a-fA-F]{4})', lambda m: m.group(1) + chr(int(m.group(2), 16)), v)
+    return re.sub(r'\\(.)', lambda m: m.group(1) if m.group(1) in ESCAPES_SNBT else MARCA_ESCAPE + m.group(1), v)
+
+
+def escapar_snbt(v):
+    return v.replace("\\", "\\\\").replace('"', '\\"').replace(MARCA_ESCAPE, "\\")
+
+
+def reconstruir_snbt(mapa, estructura):
+    final = ""
+    for es_prot, cont in estructura:
+        if es_prot:
+            final += cont
+        else:
+            inicio = cont[:len(cont) - len(cont.lstrip())]
+            fin = cont[len(cont.rstrip()):]
+            nuevo = mapa.get(cont)
+            nuevo = str(nuevo).replace("\n", " ").replace("\\", "").replace(MARCA_ESCAPE, "").strip() if nuevo else cont.strip()
+            final += inicio + nuevo + fin
+    return escapar_snbt(final)
+
+
+def validar_snbt(texto):
+    pila, i, n = [], 0, len(texto)
+    pares = {"}": "{", "]": "["}
+    while i < n:
+        c = texto[i]
+        if c in "\"'":
+            i += 1
+            while i < n and texto[i] != c:
+                if texto[i] == "\\":
+                    if i + 1 >= n or texto[i + 1] not in "\\\"'ntrbfu":
+                        return False
+                    if texto[i + 1] == "u" and not re.fullmatch(r"[0-9a-fA-F]{4}", texto[i + 2:i + 6]):
+                        return False
+                    i += 1
+                elif texto[i] == "\n":
+                    return False
+                i += 1
+            if i >= n:
+                return False
+        elif c in "{[":
+            pila.append(c)
+        elif c in "}]":
+            if not pila or pila.pop() != pares[c]:
+                return False
+        i += 1
+    return not pila
+
+
 def extraer_textos(contenido, modo_lang=False):
     textos = set()
     contexto = {} if modo_lang else contexto_listas(contenido)
     for m in RE_CADENA.finditer(contenido):
         if not cadena_permitida(m, contexto, modo_lang):
             continue
-        valor = m.group(2)
+        valor = desescapar_snbt(m.group(2))
         if es_texto_traducible(valor):
             for es_prot, txt in separar_protegidos(valor):
                 if not es_prot:
@@ -935,40 +994,230 @@ def resolver_textos(textos, traductor, idioma, nombre, indice, total):
     return mapa, fallidas
 
 
-def procesar_archivo(ruta, destino, traductor, idioma, indice=0, total=1, modo_lang=False):
+def _fin_cadena(t, i):
+    q, i, n = t[i], i + 1, len(t)
+    while i < n and t[i] != q:
+        i += 2 if t[i] == "\\" else 1
+    return i + 1
+
+
+def _fin_lista(t, i):
+    prof, n = 0, len(t)
+    while i < n:
+        c = t[i]
+        if c in "\"'":
+            i = _fin_cadena(t, i)
+            continue
+        if c in "[{":
+            prof += 1
+        elif c in "]}":
+            prof -= 1
+            if prof == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def entradas_lang(texto):
+    i = texto.find("{")
+    if i < 0:
+        return None
+    entradas, i, n = [], i + 1, len(texto)
+    while i < n:
+        while i < n and texto[i] in " \t\r\n,":
+            i += 1
+        if i >= n or texto[i] == "}":
+            return entradas
+        if texto[i] == '"':
+            j = _fin_cadena(texto, i)
+            clave = desescapar_snbt(texto[i + 1:j - 1])
+        else:
+            j = i
+            while j < n and texto[j] not in ":\n{}[]":
+                j += 1
+            clave = texto[i:j].strip()
+        i = j
+        while i < n and texto[i] in " \t":
+            i += 1
+        if i >= n or texto[i] != ":" or not clave:
+            return None
+        i += 1
+        while i < n and texto[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            return None
+        ini = i
+        if texto[i] in "\"'":
+            i = _fin_cadena(texto, i)
+        elif texto[i] in "[{":
+            i = _fin_lista(texto, i)
+        else:
+            while i < n and texto[i] not in ",\n}":
+                i += 1
+        entradas.append((clave, ini, i))
+    return entradas
+
+
+def _norm_valor(v):
+    return re.sub(r"\s+", " ", v).strip()
+
+
+_CACHE_EXISTENTES = {}
+
+
+def _familia(codigo):
+    return codigo.lower().split("_")[0]
+
+
+def _instalados_por_babel():
+    return {os.path.normcase(os.path.abspath(p)) for p in cargar_manifiesto()}
+
+
+def _archivos_idioma(raiz, extensiones, destino_mc):
+    fam = _familia(destino_mc)
+    elegidos = []
+    try:
+        nombres = sorted(os.listdir(raiz))
+    except OSError:
+        return elegidos
+    for nombre in nombres:
+        base = nombre.split(".")[0].lower()
+        if base == "en_us" or _familia(base) != fam or "_" not in base:
+            continue
+        ruta = os.path.join(raiz, nombre)
+        prioridad = 0 if base == destino_mc.lower() else 1
+        if os.path.isdir(ruta):
+            for r, _, archivos in os.walk(ruta):
+                for f in sorted(archivos):
+                    if f.lower().endswith(extensiones):
+                        elegidos.append((prioridad, os.path.join(r, f)))
+        elif nombre.lower().endswith(extensiones):
+            elegidos.append((prioridad, ruta))
+    return [r for _, r in sorted(elegidos, key=lambda x: x[0])]
+
+
+def traducciones_existentes_snbt(ruta_ref, destino_mc):
+    partes = os.path.abspath(ruta_ref).split(os.sep)
+    if "lang" not in [p.lower() for p in partes]:
+        return {}
+    idx = max(i for i, p in enumerate(partes) if p.lower() == "lang")
+    raiz = os.sep.join(partes[:idx + 1])
+    clave_cache = (raiz, destino_mc)
+    if clave_cache in _CACHE_EXISTENTES:
+        return _CACHE_EXISTENTES[clave_cache]
+    babel = _instalados_por_babel()
+    mapa = {}
+    for ruta in _archivos_idioma(raiz, (".snbt", ".snbt_merged"), destino_mc):
+        normal = os.path.normcase(os.path.abspath(ruta))
+        if normal in babel or (normal.endswith("_merged") and normal[:-len("_merged")] in babel):
+            continue
+        try:
+            with open(ruta, "r", encoding="utf-8") as f:
+                texto = f.read()
+        except Exception:
+            continue
+        for clave, ini, fin in entradas_lang(texto) or []:
+            mapa.setdefault(clave, texto[ini:fin])
+    _CACHE_EXISTENTES[clave_cache] = mapa
+    return mapa
+
+
+def traducciones_existentes_json(ruta_ref, destino_mc):
+    raiz = os.path.dirname(os.path.abspath(ruta_ref))
+    clave_cache = (raiz, destino_mc, "json")
+    if clave_cache in _CACHE_EXISTENTES:
+        return _CACHE_EXISTENTES[clave_cache]
+    babel = _instalados_por_babel()
+    mapa = {}
+    for ruta in _archivos_idioma(raiz, (".json",), destino_mc):
+        if os.path.normcase(os.path.abspath(ruta)) in babel or os.path.dirname(ruta) != raiz:
+            continue
+        try:
+            with open(ruta, "r", encoding="utf-8-sig") as f:
+                datos = json.load(f)
+        except Exception:
+            continue
+        if isinstance(datos, dict):
+            for k, v in datos.items():
+                mapa.setdefault(k, v)
+    _CACHE_EXISTENTES[clave_cache] = mapa
+    return mapa
+
+
+def procesar_archivo(ruta, destino, traductor, idioma, indice=0, total=1, modo_lang=False,
+                     existentes=None):
     with open(ruta, "r", encoding="utf-8") as f:
         contenido = f.read()
 
-    mapa, fallidas = resolver_textos(extraer_textos(contenido, modo_lang), traductor, idioma,
+    entradas = entradas_lang(contenido) if modo_lang and existentes else None
+    reuso = {}
+    for clave, ini, fin in entradas or []:
+        previo = existentes.get(clave)
+        original = contenido[ini:fin]
+        if (previo and previo[:1] == original[:1] and _norm_valor(previo) != _norm_valor(original)
+                and tiene_letras(desescapar_snbt(previo)) and validar_snbt("{a: " + previo + "}")):
+            reuso[(ini, fin)] = previo
+    if reuso:
+        log(f"♻️ {os.path.basename(ruta)}: reutilizo {len(reuso)} traducciones que ya traía el modpack; "
+            f"traduzco solo {len(entradas) - len(reuso)} de {len(entradas)}")
+        pendiente = "\n".join(contenido[ini:fin] for _, ini, fin in entradas if (ini, fin) not in reuso)
+    else:
+        pendiente = contenido
+
+    mapa, fallidas = resolver_textos(extraer_textos(pendiente, modo_lang), traductor, idioma,
                                      os.path.basename(ruta), indice, total)
 
     contexto = {} if modo_lang else contexto_listas(contenido)
 
     def replacer(match):
-        clave, valor_orig, todo = match.group(1), match.group(2), match.group(0)
+        clave, todo = match.group(1), match.group(0)
+        valor_orig = desescapar_snbt(match.group(2))
         if not cadena_permitida(match, contexto, modo_lang) or not es_texto_traducible(valor_orig):
             return todo
-        nuevo = reconstruir(mapa, separar_protegidos(valor_orig))
+        nuevo = reconstruir_snbt(mapa, separar_protegidos(valor_orig))
         return f'{clave if clave else ""}"{nuevo}"'
 
-    nuevo_contenido = RE_CADENA.sub(replacer, contenido)
+    if reuso:
+        partes_salida, previo_fin = [], 0
+        for _, ini, fin in entradas:
+            partes_salida.append(contenido[previo_fin:ini])
+            partes_salida.append(reuso.get((ini, fin)) or RE_CADENA.sub(replacer, contenido[ini:fin]))
+            previo_fin = fin
+        partes_salida.append(contenido[previo_fin:])
+        nuevo_contenido = "".join(partes_salida)
+    else:
+        nuevo_contenido = RE_CADENA.sub(replacer, contenido)
+    if not validar_snbt(nuevo_contenido) and validar_snbt(contenido):
+        log(f"⚠️ {os.path.basename(ruta)}: la traducción no pasó la revisión de formato; dejé este archivo en su idioma original para no romper el modpack.")
+        nuevo_contenido = contenido
+        fallidas = max(fallidas, 1)
     os.makedirs(os.path.dirname(destino), exist_ok=True)
     with open(destino, "w", encoding="utf-8", newline="\n") as f:
         f.write(nuevo_contenido)
     return fallidas
 
 
-def procesar_json(ruta, destino, traductor, idioma, indice=0, total=1):
+def procesar_json(ruta, destino, traductor, idioma, indice=0, total=1, existentes=None):
     with open(ruta, "r", encoding="utf-8-sig") as f:
         datos = json.load(f)
     if not isinstance(datos, dict):
         raise ValueError("no parece un archivo de idioma (se esperaba un objeto JSON)")
 
-    mapa, fallidas = resolver_textos(extraer_textos_json(datos), traductor, idioma,
+    existentes = existentes or {}
+    reuso = {k: existentes[k] for k, v in datos.items()
+             if isinstance(v, str) and isinstance(existentes.get(k), str)
+             and _norm_valor(existentes[k]) != _norm_valor(v) and tiene_letras(existentes[k])}
+    if reuso:
+        log(f"♻️ {os.path.basename(ruta)}: reutilizo {len(reuso)} traducciones que ya traía el modpack; "
+            f"traduzco solo {len(datos) - len(reuso)} de {len(datos)}")
+    pendientes = {k: v for k, v in datos.items() if k not in reuso}
+    mapa, fallidas = resolver_textos(extraer_textos_json(pendientes), traductor, idioma,
                                      os.path.basename(ruta), indice, total)
     salida = {}
     for clave, valor in datos.items():
-        if valor_json_traducible(valor):
+        if clave in reuso:
+            salida[clave] = reuso[clave]
+        elif valor_json_traducible(valor):
             salida[clave] = reconstruir_json(mapa, separar_protegidos(valor, REGEX_JSON))
         else:
             salida[clave] = valor
@@ -1288,7 +1537,7 @@ def descubrir(ruta_entrada, incluir_todo=False):
                 except Exception:
                     motivo = "no se pudo leer"
                 idiomas.append({"ruta": ruta, "tipo": "json", "relevante": relevante, "motivo": motivo, "tam": tam})
-            elif fl.endswith(".snbt") and es_lang_snbt(ruta):
+            elif (fl.endswith(".snbt") or fl.endswith(".snbt_merged")) and es_lang_snbt(ruta):
                 rel = "ftbquests" in ruta.lower()
                 idiomas.append({"ruta": ruta, "tipo": "snbt", "relevante": rel, "tam": tam,
                                 "motivo": "idioma nativo de FTB Quests" if rel else "no parece de misiones"})
@@ -1302,6 +1551,8 @@ def descubrir(ruta_entrada, incluir_todo=False):
 
 def mapear_ruta(ruta, lang, es_lang):
     carpeta, nombre = os.path.split(ruta)
+    if es_lang and nombre.lower().endswith(".snbt_merged"):
+        nombre = nombre[:-len("_merged")]
     if nombre.lower() in ("en_us.json", "en_us.snbt"):
         nombre = lang["mc"] + os.path.splitext(nombre)[1]
     if carpeta and es_lang:
@@ -1350,6 +1601,7 @@ def instalar_archivo(generado, objetivo, manifiesto):
 def iniciar_proceso(ruta_entrada, lang, api_deepl, instalar=False, incluir_todo=False, libre_url=""):
     global REGEX_PROTEGIDO, REGEX_JSON
     idioma, nombre_idioma = lang["id"], lang["nombre"]
+    _CACHE_EXISTENTES.clear()
     try:
         log("🔎 Buscando misiones e idiomas en el modpack...")
         info = descubrir(ruta_entrada, incluir_todo)
@@ -1456,9 +1708,13 @@ def iniciar_proceso(ruta_entrada, lang, api_deepl, instalar=False, incluir_todo=
                 if tipo:
                     sin_traducir = procesar_estructurado(src, dest, traductor, idioma, tipo, i, total)
                 elif es_json:
-                    sin_traducir = procesar_json(src, dest, traductor, idioma, i, total)
+                    sin_traducir = procesar_json(src, dest, traductor, idioma, i, total,
+                                                 existentes=traducciones_existentes_json(a, lang["mc"]))
                 else:
-                    sin_traducir = procesar_archivo(src, dest, traductor, idioma, i, total, modo_lang=es_lang_snbt(a))
+                    en_lang = es_lang_snbt(a)
+                    sin_traducir = procesar_archivo(
+                        src, dest, traductor, idioma, i, total, modo_lang=en_lang,
+                        existentes=traducciones_existentes_snbt(a, lang["mc"]) if en_lang else None)
                 if sin_traducir:
                     log(f"⚠️ {os.path.basename(a)}: {sin_traducir} textos sin traducir")
                 else:

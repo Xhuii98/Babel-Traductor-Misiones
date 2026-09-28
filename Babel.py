@@ -31,7 +31,7 @@ except ImportError as e:
     messagebox.showerror("Falta una librería", f"{e}\n\nEscribe en tu consola (cmd):\npython -m pip install customtkinter")
     sys.exit()
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 NOMBRE_APP = "Babel"
 RUTA_SALIDA_FIJA = os.path.join(os.path.expanduser("~"), "Documents", NOMBRE_APP)
 _RUTA_ANTIGUA = os.path.join(os.path.expanduser("~"), "Documents", "FTB_Translator")
@@ -183,6 +183,7 @@ GOOGLE_CABECERAS = {
                   "Chrome/128.0 Safari/537.36",
     "Accept": "*/*",
 }
+GOOGLE_CLIENTES = ["dict-chrome-ex", "at", "gtx"]
 GOOGLE_LOTE_CARACTERES = 3500
 GOOGLE_INTERVALO = 1.2
 _google_lock = threading.Lock()
@@ -195,12 +196,21 @@ def _google_peticion(texto, destino):
         if espera > 0:
             time.sleep(espera)
         _google_ultimo[0] = time.time()
-    r = requests.post(GOOGLE_URL, params={"client": "gtx", "sl": "auto", "tl": destino, "dt": "t"},
-                      data={"q": texto}, headers=GOOGLE_CABECERAS, timeout=30)
-    if r.status_code == 429:
-        raise RuntimeError("429 Google: TooManyRequests")
-    if r.status_code != 200:
-        raise RuntimeError(f"Google HTTP {r.status_code}")
+    ultimo = None
+    for _ in range(len(GOOGLE_CLIENTES)):
+        cliente = GOOGLE_CLIENTES[0]
+        r = requests.post(GOOGLE_URL, params={"client": cliente, "sl": "auto", "tl": destino, "dt": "t"},
+                          data={"q": texto}, headers=GOOGLE_CABECERAS, timeout=30)
+        if r.status_code == 200:
+            break
+        ultimo = r.status_code
+        with _google_lock:
+            if GOOGLE_CLIENTES[0] == cliente:
+                GOOGLE_CLIENTES.append(GOOGLE_CLIENTES.pop(0))
+    else:
+        if ultimo == 429:
+            raise RuntimeError("429 Google: TooManyRequests")
+        raise RuntimeError(f"Google HTTP {ultimo}")
     datos = r.json()
     return "".join(seg[0] for seg in (datos[0] or []) if seg and isinstance(seg[0], str))
 

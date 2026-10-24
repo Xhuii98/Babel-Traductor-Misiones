@@ -1,8 +1,10 @@
 import os
 import re
+import base64
 import sys
 import json
 import time
+import tempfile
 import queue
 import random
 import threading
@@ -10,6 +12,7 @@ import shutil
 import hashlib
 import subprocess
 import zipfile
+import bisect
 import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -31,7 +34,7 @@ except ImportError as e:
     messagebox.showerror("Falta una librería", f"{e}\n\nEscribe en tu consola (cmd):\npython -m pip install customtkinter")
     sys.exit()
 
-VERSION = "1.5.0"
+VERSION = "1.6.1"
 NOMBRE_APP = "Babel"
 RUTA_SALIDA_FIJA = os.path.join(os.path.expanduser("~"), "Documents", NOMBRE_APP)
 _RUTA_ANTIGUA = os.path.join(os.path.expanduser("~"), "Documents", "FTB_Translator")
@@ -1065,6 +1068,35 @@ def _norm_valor(v):
 _CACHE_EXISTENTES = {}
 
 
+def decode_lgq1_content(content: str) -> str:
+    """Reemplaza LGQ1:<base64> por el texto plano decodificado y escapado para SNBT."""
+    pattern = r'LGQ1:([A-Za-z0-9+/=]+)'
+
+    def replacer(match):
+        try:
+            decoded = base64.b64decode(match.group(1)).decode('utf-8')
+            # Escapar para que no rompa el SNBT
+            decoded = decoded.replace('\\', '\\\\').replace('"', '\\"')
+            decoded = decoded.replace('\n', '\\n')
+            return decoded
+        except Exception:
+            return match.group(0)
+
+    return re.sub(pattern, replacer, content)
+
+
+def _leer_con_lgq1(ruta):
+    """Lee un archivo y decodifica LGQ1 en memoria si está presente."""
+    try:
+        with open(ruta, 'r', encoding='utf-8') as fh:
+            contenido = fh.read()
+    except Exception:
+        return None
+    if 'LGQ1:' not in contenido:
+        return contenido
+    return decode_lgq1_content(contenido)
+
+
 def _familia(codigo):
     return codigo.lower().split("_")[0]
 
@@ -1358,8 +1390,24 @@ def es_lang_snbt(ruta):
 
 
 def carpeta_misiones(ruta):
+    """Devuelve una lista de todas las rutas posibles donde pueden estar misiones."""
+    rutas = []
+    # Rutas estándar de FTB Quests / Better Questing
     cand = os.path.join(ruta, "config", "ftbquests", "quests")
-    return cand if os.path.isdir(cand) else ruta
+    if os.path.isdir(cand):
+        rutas.append(cand)
+    # Rutas alternativas (kubejs/data/...)
+    for sub in [
+        os.path.join(ruta, "kubejs", "data", "ftbquests", "quests"),
+        os.path.join(ruta, "kubejs", "data", "minecraft", "quests"),
+        os.path.join(ruta, "kubejs", "data", "betterquests", "DefaultQuests"),
+    ]:
+        if os.path.isdir(sub):
+            rutas.append(sub)
+    # Si no encontró nada específico, usa la raíz
+    if not rutas:
+        rutas.append(ruta)
+    return rutas
 
 
 def recorrer(raiz, podar):
@@ -1424,6 +1472,79 @@ def buscar_en_empaquetados(raiz, faltan):
     return hallados
 
 
+RE_PROTEGIDO = re.compile(r"^\s*[A-Z0-9]{2,8}:[A-Za-z0-9+/=\r\n]{16,}")
+CONFIG_EXTRACTOR = os.path.join("config", "translations_extractor-client.toml")
+
+
+def archivo_protegido(ruta):
+    try:
+        with open(ruta, "r", encoding="utf-8", errors="ignore") as f:
+            return bool(RE_PROTEGIDO.match(f.read(300)))
+    except OSError:
+        return False
+
+
+def buscar_extractor(raiz):
+    hallados = []
+    rp = os.path.join(raiz, "resourcepacks")
+    try:
+        paquetes = sorted(d for d in os.listdir(rp)
+                          if d.lower().startswith("extractedtranslations") and os.path.isdir(os.path.join(rp, d)))
+    except OSError:
+        return hallados
+    for paquete in paquetes:
+        assets = os.path.join(rp, paquete, "assets")
+        if not os.path.isdir(assets):
+            continue
+        for ns in sorted(os.listdir(assets)):
+            carpeta_lang = os.path.join(assets, ns, "lang")
+            if not os.path.isdir(carpeta_lang):
+                continue
+            for nombre in sorted(os.listdir(carpeta_lang)):
+                if not nombre.lower().endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(carpeta_lang, nombre), "r", encoding="utf-8-sig") as fh:
+                        datos = json.load(fh)
+                except Exception:
+                    continue
+                utiles = {k: v for k, v in datos.items() if isinstance(v, str) and tiene_letras(v)} \
+                    if isinstance(datos, dict) else {}
+                if not utiles:
+                    continue
+                extraido = os.path.join(RUTA_SALIDA_FIJA, "_extraido", os.path.basename(raiz), paquete,
+                                        "assets", ns, "lang", "en_us.json")
+                os.makedirs(os.path.dirname(extraido), exist_ok=True)
+                with open(extraido, "w", encoding="utf-8") as fh:
+                    json.dump(utiles, fh, ensure_ascii=False, indent=2)
+                de_misiones = ns.lower() in ("ftbquests", "ftbquestlocalizer") or \
+                    any(k.lower().startswith("ftbquests") for k in utiles)
+                hallados.append({"ruta": extraido, "tipo": "json", "relevante": de_misiones, "empacado": True,
+                                 "ns": ns, "tam": os.path.getsize(extraido), "extractor": nombre[:-5].lower(),
+                                 "motivo": (f"misiones sacadas por Translations Extractor ({len(utiles)} textos)"
+                                            if de_misiones else f"textos de otros mods ({len(utiles)})")})
+    return hallados
+
+
+def ajustar_extractor(raiz, codigo):
+    ruta = os.path.join(raiz, CONFIG_EXTRACTOR)
+    if not os.path.isfile(ruta):
+        return None
+    try:
+        with open(ruta, "r", encoding="utf-8") as fh:
+            texto = fh.read()
+        m = re.search(r'(?m)^(\s*targetLanguage\s*=\s*)"([^"]*)"', texto)
+        if not m or m.group(2).lower() == codigo.lower():
+            return False
+        if not os.path.exists(ruta + ".respaldo"):
+            shutil.copy2(ruta, ruta + ".respaldo")
+        with open(ruta, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(texto[:m.start(2)] + codigo + texto[m.end(2):])
+        return True
+    except Exception:
+        return None
+
+
 def formato_paquete(raiz):
     version = ""
     try:
@@ -1478,22 +1599,41 @@ def preparar_paquete(raiz, nombre_idioma):
 
 
 def descubrir(ruta_entrada, incluir_todo=False):
-    misiones, candidatos = [], set()
-    raiz_q = carpeta_misiones(ruta_entrada)
-    for r, files in recorrer(raiz_q, IGNORAR_CARPETAS | PODAR_INSTANCIA):
-        for f in files:
-            ruta = os.path.join(r, f)
-            en_lang = "lang" in ruta.replace("\\", "/").lower().split("/")[:-1]
-            if f.endswith(".snbt") and f not in IGNORAR_ARCHIVOS and not en_lang:
-                misiones.append(ruta)
-                nombre = f.replace(".snbt", "").replace("_", " ").title()
-                if "Ae2" in nombre:
-                    nombre = "AE2"
-                if "Rftools" in nombre:
-                    nombre = "RFTools"
-                candidatos.add(nombre)
-                if nombre.endswith("s"):
-                    candidatos.add(nombre[:-1])
+    misiones, candidatos, protegidos = [], set(), []
+    raiz_qs = carpeta_misiones(ruta_entrada)
+    for raiz_q in raiz_qs:
+        for r, files in recorrer(raiz_q, IGNORAR_CARPETAS | PODAR_INSTANCIA):
+            for f in files:
+                ruta = os.path.join(r, f)
+                en_lang = "lang" in ruta.replace("\\", "/").lower().split("/")[:-1]
+                if f.endswith(".snbt") and f not in IGNORAR_ARCHIVOS and not en_lang:
+                    if archivo_protegido(ruta):
+                        protegidos.append(ruta)
+                        continue
+                    misiones.append(ruta)
+                    nombre = f.replace(".snbt", "").replace("_", " ").title()
+                    if "Ae2" in nombre:
+                        nombre = "AE2"
+                    if "Rftools" in nombre:
+                        nombre = "RFTools"
+                    candidatos.add(nombre)
+                    if nombre.endswith("s"):
+                        candidatos.add(nombre[:-1])
+
+    # Decodificar LGQ1 si está presente (solo en archivos .snbt de misiones)
+    for a in list(misiones):
+        try:
+            with open(a, "r", encoding="utf-8") as fh:
+                contenido = fh.read()
+        except Exception:
+            continue
+        if "LGQ1:" not in contenido:
+            continue
+        decoded = decode_lgq1_content(contenido)
+        backup_path = a + ".backup_lgq1"
+        shutil.copy2(a, backup_path)
+        with open(a, "w", encoding="utf-8") as fh:
+            fh.write(decoded)
 
     estructurados = buscar_estructurados(ruta_entrada)
     manifiesto, origenes = cargar_manifiesto(), {}
@@ -1507,10 +1647,11 @@ def descubrir(ruta_entrada, incluir_todo=False):
     referencias, n_refs = set(), 0
     for a in misiones:
         try:
-            with open(origenes.get(a, a), "r", encoding="utf-8") as fh:
-                encontradas = RE_REFERENCIA_CLAVE.findall(fh.read())
-            n_refs += len(encontradas)
-            referencias.update(encontradas)
+            contenido = _leer_con_lgq1(origenes.get(a, a))
+            if contenido is not None:
+                encontradas = RE_REFERENCIA_CLAVE.findall(contenido)
+                n_refs += len(encontradas)
+                referencias.update(encontradas)
         except Exception:
             pass
 
@@ -1545,8 +1686,9 @@ def descubrir(ruta_entrada, incluir_todo=False):
     faltan = referencias - cubiertas
     if faltan and not hay_snbt_lang:
         idiomas += buscar_en_empaquetados(raiz_instancia(ruta_entrada), set(faltan))
+    idiomas += buscar_extractor(raiz_instancia(ruta_entrada))
     return {"misiones": misiones, "candidatos": candidatos, "lang": idiomas, "n_refs": n_refs, "origenes": origenes,
-            "estructurados": estructurados}
+            "estructurados": estructurados, "protegidos": protegidos}
 
 
 def mapear_ruta(ruta, lang, es_lang):
@@ -1616,6 +1758,33 @@ def iniciar_proceso(ruta_entrada, lang, api_deepl, instalar=False, incluir_todo=
         omitidos = [l for l in info["lang"] if l not in elegidos]
         archivos = list(info["misiones"]) + list(estructurados) + [l["ruta"] for l in elegidos]
         total = len(archivos)
+        protegidos = info["protegidos"]
+        if protegidos:
+            log(f"🔒 {len(protegidos)} archivos de misiones están protegidos por el autor del modpack. "
+                "Babel no los lee ni los modifica.")
+            ajuste = ajustar_extractor(raiz_instancia(ruta_entrada), lang["mc"])
+            if ajuste:
+                log(f"🔧 Ajusté Translations Extractor para que saque los textos en {lang['mc']}. "
+                    "Vuelve a ejecutar /extract translations lang en el juego.")
+            if not any(l.get("extractor") for l in elegidos):
+                log("ℹ️ Para traducirlo: agrega los mods «Translations Extractor» y «FTB Quest Localizer», "
+                    "entra a un mundo, escribe /extract translations lang y vuelve a usar Babel.")
+        for l in elegidos:
+            if l.get("extractor") and l["extractor"] != lang["mc"].lower():
+                log(f"ℹ️ El extractor sacó textos pensados para {l['extractor']}; Babel los traduce a {nombre_idioma}.")
+                break
+        if total == 0 and protegidos:
+            aviso("error", "Este modpack protege sus misiones",
+                  "El autor del modpack protegió los archivos de misiones, así que Babel no puede leerlos "
+                  "(y no va a modificarlos).\n\n"
+                  "Para traducirlo de forma segura:\n"
+                  "1. Agrega al modpack los mods «Translations Extractor» y «FTB Quest Localizer».\n"
+                  "2. Abre el juego una vez y ciérralo.\n"
+                  "3. Abre Babel y pulsa Traducir: ajustará el extractor a tu idioma.\n"
+                  "4. Abre el juego, entra a un mundo y escribe: /extract translations lang\n"
+                  "5. Cierra el juego y vuelve a pulsar Traducir en Babel. Traducirá esos textos y "
+                  "activará un paquete de recursos con la traducción.")
+            return
         if total == 0:
             aviso("error", "No encontré nada que traducir",
                   "No encontré misiones de FTB Quests, Better Questing ni Heracles/Odyssey Quests, "
@@ -1665,10 +1834,12 @@ def iniciar_proceso(ruta_entrada, lang, api_deepl, instalar=False, incluir_todo=
         pendientes_total, caracteres = set(), 0
         for a in archivos:
             try:
-                for t in textos_de_archivo(origenes.get(a, a), estructurados.get(a)):
-                    if f"{idioma}|{t}" not in MEMORIA_GLOBAL and t not in pendientes_total:
-                        pendientes_total.add(t)
-                        caracteres += len(t)
+                contenido = _leer_con_lgq1(origenes.get(a, a))
+                if contenido is not None:
+                    for t in textos_de_archivo(contenido, estructurados.get(a)):
+                        if f"{idioma}|{t}" not in MEMORIA_GLOBAL and t not in pendientes_total:
+                            pendientes_total.add(t)
+                            caracteres += len(t)
             except Exception as exc:
                 log(f"⚠️ No pude leer {os.path.basename(a)}: {type(exc).__name__}: {exc}")
         log(f"📊 Por traducir: {len(pendientes_total)} textos (~{caracteres:,} caracteres)")
@@ -1693,6 +1864,7 @@ def iniciar_proceso(ruta_entrada, lang, api_deepl, instalar=False, incluir_todo=
         hubo_lang = False
         hubo_paquete = False
         n_instalados = 0
+        temporales_lgq1 = []
         for i, a in enumerate(archivos):
             if DETENER.is_set():
                 raise Detenido()
@@ -1704,16 +1876,31 @@ def iniciar_proceso(ruta_entrada, lang, api_deepl, instalar=False, incluir_todo=
             src = origenes.get(a, a)
             if src != a:
                 log(f"↩ {os.path.basename(a)}: traduzco desde el original guardado (.respaldo)")
+            # Si el archivo fuente tiene LGQ1 (ej. respaldo con LGQ1), decodificar en temporal
+            src_limpio = None
+            if os.path.exists(src):
+                try:
+                    with open(src, 'r', encoding='utf-8') as fh:
+                        contenido_src = fh.read()
+                    if 'LGQ1:' in contenido_src:
+                        tmp = tempfile.NamedTemporaryFile(mode='w', suffix=os.path.splitext(src)[1],
+                                                           delete=False, encoding='utf-8')
+                        tmp.write(decode_lgq1_content(contenido_src))
+                        tmp.close()
+                        src_limpio = tmp.name
+                        temporales_lgq1.append(tmp.name)
+                except Exception:
+                    pass
             try:
                 if tipo:
-                    sin_traducir = procesar_estructurado(src, dest, traductor, idioma, tipo, i, total)
+                    sin_traducir = procesar_estructurado(src_limpio or src, dest, traductor, idioma, tipo, i, total)
                 elif es_json:
-                    sin_traducir = procesar_json(src, dest, traductor, idioma, i, total,
+                    sin_traducir = procesar_json(src_limpio or src, dest, traductor, idioma, i, total,
                                                  existentes=traducciones_existentes_json(a, lang["mc"]))
                 else:
                     en_lang = es_lang_snbt(a)
                     sin_traducir = procesar_archivo(
-                        src, dest, traductor, idioma, i, total, modo_lang=en_lang,
+                        src_limpio or src, dest, traductor, idioma, i, total, modo_lang=en_lang,
                         existentes=traducciones_existentes_snbt(a, lang["mc"]) if en_lang else None)
                 if sin_traducir:
                     log(f"⚠️ {os.path.basename(a)}: {sin_traducir} textos sin traducir")
@@ -1747,6 +1934,13 @@ def iniciar_proceso(ruta_entrada, lang, api_deepl, instalar=False, incluir_todo=
             except Exception as e:
                 log(f"❌ {os.path.basename(a)}: {type(e).__name__}: {e}")
             progreso(((i + 1) / total) * 100)
+            # Limpiar archivos temporales LGQ1 creados en este bucle
+            for tmp in temporales_lgq1:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+            temporales_lgq1.clear()
 
         guardar_seguro()
         if instalar and "bq" in estructurados.values():
@@ -1814,13 +2008,18 @@ def iniciar_proceso(ruta_entrada, lang, api_deepl, instalar=False, incluir_todo=
         COLA.put(("fin",))
 
 
+# Paleta neón: negro violeta, morado y cian
 C = {
-    "fondo": "#0F1216", "tarjeta": "#1A1F27", "borde": "#2A313C", "borde_hover": "#38414F",
-    "acento": "#4ADE80", "acento_hover": "#22C55E", "texto_acento": "#08210F",
-    "texto": "#E6EAF0", "suave": "#9AA4B2",
-    "peligro": "#EF4444", "peligro_fondo": "#3A1D1D",
-    "consola": "#0B0E12", "consola_txt": "#9BF0B5", "ok": "#4ADE80", "mal": "#F87171",
+    "fondo": "#07060D", "lateral": "#0B0916", "tarjeta": "#110E1E", "campo": "#0A0814",
+    "borde": "#251E3E", "borde_hover": "#3B2F66", "boton": "#1A1530", "boton_hover": "#272048",
+    "nav_hover": "#14102A", "nav_activo": "#1C1538",
+    "morado": "#A855F7", "cian": "#22D3EE", "aviso": "#FFC857",
+    "texto": "#F4F3FF", "suave": "#9C97BD", "tenue": "#5E5880",
+    "peligro": "#FF4D6D", "peligro_fondo": "#3A1224",
+    "consola": "#05040A", "consola_txt": "#C4BFEA", "ok": "#2EF2A0", "ok_fondo": "#0E2E24", "mal": "#FF4D6D",
 }
+DISPLAY = "Bahnschrift SemiBold"
+INTERRUPTOR = dict(progress_color=C["morado"], fg_color=C["borde"], button_color=C["texto"], button_hover_color="#FFFFFF")
 ARCHIVO_CONFIG = os.path.join(RUTA_SALIDA_FIJA, "config.json")
 URL_DEEPL = "https://www.deepl.com/pro-api"
 
@@ -1852,33 +2051,162 @@ def abrir_carpeta(ruta):
         messagebox.showerror("No pude abrir la carpeta", str(exc))
 
 
+# Animación: en cada cuadro lo mostrado se acerca al objetivo (suavizado = ease-out, y se interrumpe solo)
+OBJETIVO = {"prog": 0.0, "nuevas": 0, "cache": 0, "fallidas": 0, "alfa": 100, "desliz": 0, "indicador": 0}
+MOSTRADO = {"prog": 0.0, "nuevas": 0, "cache": 0, "fallidas": 0, "alfa": 0, "desliz": 0, "indicador": 0}
+FUNDIDOS = {}
+TRADUCIENDO = [False]
+CUADRO = [0]
+PAGINA = [None, None]  # página visible y su botón de la barra lateral
+ESTILOS_LOG = {"ok": "✅🎉", "aviso": "⚠🐢⏳", "error": "⛔❌💥🛑", "tenue": "➖ℹ"}
+
+
+def mezclar(a, b, t):
+    a, b = int(a[1:], 16), int(b[1:], 16)
+    return "#" + "".join(f"{round((a >> s & 255) * (1 - t) + (b >> s & 255) * t):02X}" for s in (16, 8, 0))
+
+
+def fundir(widget, prop, desde, hasta, ms=700):
+    FUNDIDOS[(widget, prop)] = (time.time(), ms / 1000, desde, hasta)
+
+
+def dibujar(clave, v):
+    if clave == "prog":
+        barra.set(v / 100)
+        mini_barra.set(v / 100)
+        texto = f"{v:.0f}%"
+        lbl_pct.poner(texto=texto)
+        if lbl_mini_pct.cget("text") != texto:
+            lbl_mini_pct.configure(text=texto)
+    elif clave == "alfa":
+        app.attributes("-alpha", v / 100)
+    elif clave == "desliz":
+        PAGINA[0].place(x=v, y=0, relwidth=1, relheight=1)
+    elif clave == "indicador":
+        indicador.place(x=0, y=v)
+    else:
+        n = round(v)
+        stats[clave].configure(text=f"{n:,}".replace(",", " "), text_color=C["mal"] if clave == "fallidas" and n else C["texto"])
+
+
+def animar():
+    try:
+        CUADRO[0] += 1
+        for clave, meta in OBJETIVO.items():
+            lento = clave in stats  # los contadores a ~10 cuadros/s: redibujar etiquetas en cada cuadro es caro
+            if lento and CUADRO[0] % 6:
+                continue
+            v = MOSTRADO[clave]
+            if v != meta:
+                v = meta if abs(meta - v) < 0.4 else v + (meta - v) * (0.5 if lento else 0.18)
+                MOSTRADO[clave] = v
+                dibujar(clave, v)
+        ahora = time.time()
+        for (w, prop), (t0, dur, desde, hasta) in list(FUNDIDOS.items()):
+            t = min(1.0, (ahora - t0) / dur)
+            w.configure(**{prop: mezclar(desde, hasta, 1 - (1 - t) ** 3)})
+            if t == 1.0:
+                del FUNDIDOS[(w, prop)]
+        if PAGINA[1]:
+            b = PAGINA[1]
+            OBJETIVO["indicador"] = b.winfo_y() + (b.winfo_height() - indicador.winfo_reqheight()) / 2
+        if TRADUCIENDO[0] and btn_inicio.winfo_ismapped():
+            btn_inicio.brillar(0.3 + 0.7 * abs(ahora % 2 - 1))
+            puntos = int(ahora * 2.5) % 4
+            texto = "TRADUCIENDO" + "." * puntos + " " * (3 - puntos)
+            if btn_inicio.texto != texto:
+                btn_inicio.poner(texto=texto)
+    finally:
+        app.after(16, animar)
+
+
+def estilo_log(linea):
+    return next((tag for tag, iniciales in ESTILOS_LOG.items() if linea and linea[0] in iniciales), "")
+
+
 def bombear():
+    hay_log = False
     try:
         while True:
             item = COLA.get_nowait()
             tipo = item[0]
             if tipo == "log":
-                txt.insert("end", item[1] + "\n")
-                txt.see("end")
+                txt.insert("end", item[1] + "\n", estilo_log(item[1]))
+                hay_log = True
             elif tipo == "prog":
-                barra.set(max(0.0, min(1.0, item[1] / 100)))
-                lbl_pct.configure(text=f"{item[1]:.0f}%")
+                OBJETIVO["prog"] = max(0.0, min(100.0, item[1]))
             elif tipo == "estado":
                 lbl_estado.configure(text=item[1])
             elif tipo == "motor":
                 if item[1] in chips:
-                    chips[item[1]].configure(text_color=C["ok"] if item[2] else C["mal"])
+                    pintar_motor(item[1], item[2])
             elif tipo == "info":
                 messagebox.showinfo(item[1], item[2])
             elif tipo == "error":
                 messagebox.showerror(item[1], item[2])
             elif tipo == "fin":
-                btn_inicio.configure(state="normal")
-                btn_stop.configure(state="disabled")
-                lbl_estado.configure(text="Listo para empezar")
+                TRADUCIENDO[0] = False
+                btn_inicio.poner(activo=True, texto="▶  TRADUCIR")
+                btn_inicio.brillar(0.55)
+                btn_stop.configure(state="disabled", border_color=C["borde"])
+                if OBJETIVO["prog"] >= 99.5 and not DETENER.is_set():
+                    lbl_estado.configure(text="¡Traducción terminada!", text_color=C["ok"])
+                    lbl_mini.configure(text="●  Terminado", text_color=C["ok"])
+                    lbl_pct.poner(color=C["ok"])
+                    barra.colores = (C["ok"], C["cian"])
+                    barra.pintar()
+                else:
+                    lbl_estado.configure(text="Listo para empezar")
+                    lbl_mini.configure(text="●  En espera", text_color=C["suave"])
     except queue.Empty:
         pass
+    if hay_log:
+        txt.see("end")  # una vez por tanda: cada see() redibuja la barra de scroll
+    for clave in stats:
+        OBJETIVO[clave] = ESTADO[clave]
     app.after(100, bombear)
+
+
+def validar_ruta(_=None):
+    ruta = entrada_ruta.get().strip()
+    if not ruta:
+        texto, color = "", C["suave"]
+    elif not os.path.isdir(ruta):
+        texto, color = "✗  Esa carpeta no existe", C["mal"]
+    else:
+        raiz = raiz_instancia(ruta)
+        if os.path.isdir(os.path.join(raiz, "mods")) or os.path.isfile(os.path.join(raiz, "options.txt")):
+            texto, color = f"✓  Modpack: {os.path.basename(raiz)}", C["ok"]
+        else:
+            texto, color = "Existe, pero no parece la carpeta de un modpack", C["aviso"]
+    lbl_ruta.configure(text=texto, text_color=color)
+
+
+def alternar_clave():
+    ver = btn_ojo.cget("text_color") != C["cian"]
+    entrada_api.configure(show="" if ver else "•")
+    btn_ojo.configure(text_color=C["cian"] if ver else C["texto"])
+
+
+def navegar(clave):
+    pagina, boton = PAGINAS[clave]
+    if PAGINA[0] is pagina:
+        return
+    for otra, b in PAGINAS.values():
+        b.marcar(False)
+        otra.place_forget()
+    boton.marcar(True)
+    PAGINA[:] = [pagina, boton]
+    MOSTRADO["desliz"] = 28  # la página entra deslizándose desde la derecha
+    dibujar("desliz", 28)
+    indicador.place(x=0, y=MOSTRADO["indicador"])
+
+
+def copiar_registro():
+    app.clipboard_clear()
+    app.clipboard_append(txt.get("1.0", "end-1c"))
+    btn_copiar.configure(text="✓  Copiado", text_color=C["ok"])
+    app.after(1500, lambda: btn_copiar.configure(text="Copiar", text_color=C["suave"]))
 
 
 def elegir_carpeta():
@@ -1886,6 +2214,7 @@ def elegir_carpeta():
     if ruta:
         entrada_ruta.delete(0, "end")
         entrada_ruta.insert(0, ruta)
+        validar_ruta()
 
 
 def boton_iniciar():
@@ -1907,13 +2236,18 @@ def boton_iniciar():
     DETENER.clear()
     ESTADO.update({"nuevas": 0, "cache": 0, "fallidas": 0, "motores": {}})
     txt.delete("1.0", "end")
-    barra.set(0)
-    lbl_pct.configure(text="0%")
-    for chip in chips.values():
-        chip.configure(text_color=C["suave"])
-    btn_inicio.configure(state="disabled")
-    btn_stop.configure(state="normal")
+    OBJETIVO["prog"] = 0.0
+    barra.colores = (C["morado"], C["cian"])
+    barra.pintar()
+    lbl_pct.poner(color=C["cian"])
+    lbl_estado.configure(text_color=C["suave"])
+    for nombre in chips:
+        pintar_motor(nombre)
+    TRADUCIENDO[0] = True
+    btn_inicio.poner(activo=False)
+    btn_stop.configure(state="normal", border_color=C["peligro"])
     lbl_estado.configure(text="Probando motores de traducción...")
+    lbl_mini.configure(text="●  Traduciendo", text_color=C["cian"])
     threading.Thread(target=iniciar_proceso, args=(ruta, lang, api, bool(var_instalar.get()), bool(var_todo.get()), libre),
                      daemon=True).start()
 
@@ -1923,32 +2257,291 @@ def boton_detener():
     log("⏳ Deteniendo...")
 
 
-def tarjeta(padre, numero, titulo, subtitulo):
-    marco = ctk.CTkFrame(padre, fg_color=C["tarjeta"], corner_radius=14, border_width=1, border_color=C["borde"])
-    marco.pack(fill="x", pady=(0, 12))
-    cab = ctk.CTkFrame(marco, fg_color="transparent")
-    cab.pack(fill="x", padx=16, pady=(14, 8))
-    ctk.CTkLabel(cab, text=str(numero), width=28, height=28, corner_radius=14, fg_color=C["acento"],
-                 text_color=C["texto_acento"], font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
-    col = ctk.CTkFrame(cab, fg_color="transparent")
-    col.pack(side="left", padx=10)
-    ctk.CTkLabel(col, text=titulo, text_color=C["texto"], anchor="w",
-                 font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w")
-    ctk.CTkLabel(col, text=subtitulo, text_color=C["suave"], anchor="w",
-                 font=ctk.CTkFont(size=12)).pack(anchor="w")
+def tarjeta(padre, **pack):
+    marco = ctk.CTkFrame(padre, fg_color=C["tarjeta"], corner_radius=16, border_width=1, border_color=C["borde"])
+    marco.pack(**{"fill": "x", "pady": (0, 16), **pack})
     cuerpo = ctk.CTkFrame(marco, fg_color="transparent")
-    cuerpo.pack(fill="x", padx=16, pady=(0, 14))
+    cuerpo.pack(fill="both", expand=True, padx=22, pady=20)
     return cuerpo
 
 
+def encabezado(pagina, titulo, subtitulo):
+    fila = ctk.CTkFrame(pagina, fg_color="transparent")
+    fila.pack(fill="x")
+    ctk.CTkLabel(fila, text=titulo, text_color=C["texto"], height=38,
+                 font=ctk.CTkFont(family=DISPLAY, size=30)).pack(side="left")
+    ctk.CTkLabel(pagina, text=subtitulo, text_color=C["suave"], anchor="w", justify="left", wraplength=760,
+                 font=ctk.CTkFont(size=13)).pack(fill="x", pady=(2, 12))
+    linea = BarraNeon(pagina, 3, C["fondo"], pista="")
+    linea.configure(width=px(72))
+    linea.pack(anchor="w", pady=(0, px(22)))
+    linea.set(1)
+    return fila
+
+
+def etiqueta(padre, texto, pady=(0, 8)):
+    ctk.CTkLabel(padre, text=texto, text_color=C["suave"], height=16,
+                 font=ctk.CTkFont(family=DISPLAY, size=12)).pack(anchor="w", pady=pady)
+
+
 def boton_suave(padre, texto, comando, **kw):
-    return ctk.CTkButton(padre, text=texto, command=comando, fg_color=C["borde"], hover_color=C["borde_hover"],
+    return ctk.CTkButton(padre, text=texto, command=comando, fg_color=C["boton"], hover_color=C["boton_hover"],
                          text_color=C["texto"], corner_radius=10, **kw)
+
+
+def campo(padre, **kw):
+    e = ctk.CTkEntry(padre, height=40, corner_radius=10, fg_color=C["campo"], border_color=C["borde"],
+                     text_color=C["texto"], placeholder_text_color=C["tenue"], **kw)
+    e.bind("<FocusIn>", lambda _: e.configure(border_color=C["cian"]))
+    e.bind("<FocusOut>", lambda _: e.configure(border_color=C["borde"]))
+    return e
+
+
+def opcion(padre, texto, var):
+    ctk.CTkSwitch(padre, text=texto, variable=var, text_color=C["suave"], font=ctk.CTkFont(size=12),
+                  **INTERRUPTOR).pack(anchor="w", pady=(12, 0))
+
+
+def opcion_grande(padre, titulo, descripcion, var):
+    fila = ctk.CTkFrame(padre, fg_color="transparent")
+    fila.pack(fill="x")
+    ctk.CTkSwitch(fila, text="", variable=var, width=46, **INTERRUPTOR).pack(side="right")
+    col = ctk.CTkFrame(fila, fg_color="transparent")
+    col.pack(side="left", fill="x", expand=True)
+    ctk.CTkLabel(col, text=titulo, text_color=C["texto"], anchor="w", height=22,
+                 font=ctk.CTkFont(size=14, weight="bold")).pack(fill="x")
+    ctk.CTkLabel(col, text=descripcion, text_color=C["suave"], anchor="w", justify="left", wraplength=600,
+                 font=ctk.CTkFont(size=12)).pack(fill="x")
+
+
+def tarjeta_motor(padre, nombre, descripcion, **pack):
+    c = tarjeta(padre, **pack)
+    fila = ctk.CTkFrame(c, fg_color="transparent")
+    fila.pack(fill="x")
+    ctk.CTkLabel(fila, text=nombre, text_color=C["texto"], font=ctk.CTkFont(family=DISPLAY, size=18)).pack(side="left")
+    estados[nombre] = ctk.CTkLabel(fila, text="", height=26, corner_radius=13, font=ctk.CTkFont(size=12))
+    estados[nombre].pack(side="right")
+    chips[nombre].append(estados[nombre])
+    ctk.CTkLabel(c, text=descripcion, text_color=C["suave"], anchor="w", justify="left", wraplength=640,
+                 font=ctk.CTkFont(size=12)).pack(fill="x", pady=(2, 12))
+    return c
+
+
+def pintar_motor(nombre, ok=None):
+    for chip in chips[nombre]:
+        pintar_chip(chip, ok)
+    estados[nombre].configure(text="●  " + {None: "Sin probar", True: "Funciona", False: "Con fallos"}[ok])
+
+
+def pintar_chip(chip, ok=None):
+    color, fondo = (C["suave"], C["campo"]) if ok is None else (C["ok"], C["ok_fondo"]) if ok else (C["mal"], C["peligro_fondo"])
+    chip.configure(text_color=color)
+    if ok is None:
+        FUNDIDOS.pop((chip, "fg_color"), None)
+        chip.configure(fg_color=fondo)
+    else:
+        fundir(chip, "fg_color", mezclar(fondo, color, 0.5), fondo)  # destello al cambiar de estado
+
+
+def barra_titulo():
+    # Windows 11: pinta la barra de título con la paleta (en Windows 10 la llamada no hace nada)
+    try:
+        import ctypes
+        hwnd = ctypes.windll.user32.GetParent(app.winfo_id())
+        for atributo, hexa in ((35, C["fondo"]), (36, C["texto"])):
+            color = ctypes.c_int(int(hexa[5:7] + hexa[3:5] + hexa[1:3], 16))  # COLORREF va en BGR
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, atributo, ctypes.byref(color), 4)
+    except Exception:
+        pass
+
+
+# Tk no trae degradados, brillos ni esquinas redondas en el Canvas: se dibujan a mano
+ESCALA = [1.0]
+
+
+def px(n):
+    return round(n * ESCALA[0])
+
+
+def rect_redondo(c, x0, y0, x1, y1, r, **kw):
+    # polígono suavizado con los puntos de las esquinas duplicados para que los lados queden rectos
+    p = (x0 + r, y0, x0 + r, y0, x1 - r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y0 + r, x1, y1 - r, x1, y1 - r,
+         x1, y1, x1 - r, y1, x1 - r, y1, x0 + r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y1 - r, x0, y0 + r,
+         x0, y0 + r, x0, y0)
+    return c.create_polygon(p, smooth=True, **kw)
+
+
+def degradado(c, x0, y0, x1, y1, colores, r):
+    # columnas de color recortadas en las esquinas: de 1 px en las curvas y de 6 px en el tramo recto,
+    # porque cada columna es un objeto que Tk vuelve a pintar. Devuelve [(x, id)] de izquierda a derecha.
+    columnas, x = [], x0
+    while x < x1:
+        d = max(x0 + r - x, x - (x1 - r), 0)
+        paso = 1 if d > 0 else min(6, max(1, x1 - r - x))
+        hueco = r - max(r * r - d * d, 0) ** 0.5
+        if y1 - y0 > 2 * hueco:
+            color = mezclar(colores[0], colores[1], min((x - x0) / (x1 - x0), 1))
+            # rectángulos y no líneas: el centro de una línea de 1 px cae en medio píxel y dejaba huecos
+            columnas.append((x, c.create_rectangle(x, y0 + hueco, x + paso, y1 - hueco, fill=color, outline="")))
+        x += paso
+    return columnas
+
+
+class BarraNeon(tk.Canvas):
+    # El degradado se dibuja una vez por tamaño; set() solo muestra u oculta las columnas que cambian
+    # y mueve la punta redonda. Redibujar la barra entera en cada cuadro congelaba la ventana.
+    def __init__(self, padre, alto, fondo, pista=None):
+        super().__init__(padre, height=px(alto), bg=fondo, highlightthickness=0, bd=0)
+        self.valor, self.colores, self.columnas, self.visibles = 0.0, (C["morado"], C["cian"]), [], 0
+        self.pista = C["campo"] if pista is None else pista
+        self.bind("<Configure>", lambda _: self.pintar())
+
+    def pintar(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 2:
+            return
+        if self.pista:
+            rect_redondo(self, 0, 0, w, h, h / 2, fill=self.pista, outline="")
+        self.columnas = degradado(self, 0, 0, w, h, self.colores, h / 2)
+        self.xs = [x for x, _ in self.columnas]
+        self.visibles = len(self.columnas)
+        self.create_oval(0, 0, 0, 0, outline="", state="hidden", tags="cabeza")  # punta redonda del relleno
+        self.set(self.valor)
+
+    def set(self, v):
+        self.valor = v
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 2 or not self.pista:
+            return
+        lleno = w * max(0.0, min(1.0, v))
+        limite = lleno - h / 2 if lleno > h else -1
+        n = bisect.bisect_left(self.xs, limite)
+        for _, item in self.columnas[min(n, self.visibles):max(n, self.visibles)]:
+            self.itemconfigure(item, state="normal" if n > self.visibles else "hidden")
+        self.visibles = n
+        if lleno > h:
+            self.coords("cabeza", lleno - h, 0, lleno, h)
+            self.itemconfigure("cabeza", state="normal", fill=mezclar(self.colores[0], self.colores[1], limite / w))
+        else:
+            self.itemconfigure("cabeza", state="hidden")
+
+
+class BotonNeon(tk.Canvas):
+    def __init__(self, padre, texto, comando, fondo, alto=52):
+        self.m = px(10)  # margen para el brillo alrededor del botón
+        super().__init__(padre, height=px(alto) + 2 * self.m, bg=fondo, highlightthickness=0, bd=0, cursor="hand2")
+        self.texto, self.comando, self.fondo, self.activo, self.nivel = texto, comando, fondo, True, 0.55
+        self.bind("<Configure>", lambda _: self.dibujar())
+        self.bind("<Enter>", self._entrar)
+        self.bind("<Leave>", self._salir)
+        self.bind("<ButtonRelease-1>", self._soltar)
+
+    def dibujar(self):
+        self.delete("all")
+        w, h, m, r = self.winfo_width(), self.winfo_height(), self.m, px(14)
+        if w < 4 * m:
+            return
+        for k in (5, 4, 3, 2, 1):  # capas del brillo, de la más ancha a la más pegada
+            e = k * m / 5
+            rect_redondo(self, m - e, m - e, w - m + e, h - m + e, r + e, outline="", tags=f"brillo{k}")
+        colores = (C["morado"], C["cian"])
+        if not self.activo:
+            colores = tuple(mezclar(col, self.fondo, 0.55) for col in colores)
+        degradado(self, m, m, w - m, h - m, colores, r)
+        self.create_text(w / 2, h / 2, text=self.texto, fill=C["texto"], font=(DISPLAY, -px(18)), tags="texto")
+        self._pintar_brillo()
+
+    def brillar(self, nivel):
+        nivel = round(nivel * 20) / 20  # en escalones: cada cambio redibuja el botón entero
+        if nivel != self.nivel:
+            self.nivel = nivel
+            self._pintar_brillo()
+
+    def _pintar_brillo(self):
+        for k, fuerza in ((5, 0.06), (4, 0.12), (3, 0.2), (2, 0.3), (1, 0.45)):
+            self.itemconfigure(f"brillo{k}", fill=mezclar(self.fondo, C["morado"], fuerza * self.nivel))
+
+    def poner(self, activo=None, texto=None):
+        if texto is not None:
+            self.texto = texto
+            self.itemconfigure("texto", text=texto)
+        if activo is not None and activo != self.activo:
+            self.activo = activo
+            self.configure(cursor="hand2" if activo else "arrow")
+            self.dibujar()
+
+    def _entrar(self, _):
+        if self.activo:
+            self.brillar(1.0)
+
+    def _salir(self, _):
+        if self.activo:
+            self.brillar(0.55)
+
+    def _soltar(self, e):
+        if self.activo and 0 <= e.x < self.winfo_width() and 0 <= e.y < self.winfo_height():
+            self.comando()
+
+
+class TextoNeon(tk.Canvas):
+    def __init__(self, padre, texto, tam, color, fondo, ancho, alto):
+        super().__init__(padre, width=px(ancho), height=px(alto), bg=fondo, highlightthickness=0, bd=0)
+        self.fondo, self.texto = fondo, texto
+        fuente, x, y = (DISPLAY, -px(tam)), px(6), px(alto) / 2
+        for r in (3, 2, 1):  # halo: copias desplazadas y apagadas del texto
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
+                self.create_text(x + dx * px(r), y + dy * px(r), text=texto, font=fuente, anchor="w", tags=("t", f"halo{r}"))
+        self.create_text(x, y, text=texto, font=fuente, anchor="w", tags=("t", "nucleo"))
+        self.poner(color=color)
+
+    def poner(self, texto=None, color=None):
+        if texto is not None and texto != self.texto:  # 25 copias del texto: solo si cambió
+            self.texto = texto
+            self.itemconfigure("t", text=texto)
+        if color is not None:
+            for r, fuerza in ((3, 0.07), (2, 0.14), (1, 0.28)):
+                self.itemconfigure(f"halo{r}", fill=mezclar(self.fondo, color, fuerza))
+            self.itemconfigure("nucleo", fill=color)
+
+
+class ItemNav(ctk.CTkFrame):
+    # botón de la barra lateral con el icono en su propia columna, para que los textos queden alineados
+    def __init__(self, padre, icono, texto, comando):
+        super().__init__(padre, fg_color="transparent", corner_radius=10, height=44, cursor="hand2")
+        self.pack_propagate(False)
+        self.activo = False
+        self.icono = ctk.CTkLabel(self, text=icono, width=22, font=ctk.CTkFont(size=14))
+        self.icono.pack(side="left", padx=(14, 10))
+        self.texto = ctk.CTkLabel(self, text=texto, anchor="w", font=ctk.CTkFont(size=14))
+        self.texto.pack(side="left", fill="x", expand=True)
+        for w in (self, self.icono, self.texto):
+            w.bind("<Button-1>", lambda _: comando())
+            w.bind("<Enter>", lambda _: self._pintar(True))
+            w.bind("<Leave>", self._salir)
+        self.marcar(False)
+
+    def _salir(self, e):
+        # al pasar del marco a una de sus etiquetas también llega <Leave>: solo cuenta si el ratón salió del todo
+        w = self.winfo_containing(e.x_root, e.y_root)
+        if not (w and str(w).startswith(str(self))):
+            self._pintar(False)
+
+    def _pintar(self, encima):
+        self.configure(fg_color=C["nav_activo"] if self.activo else C["nav_hover"] if encima else "transparent")
+        color = C["texto"] if self.activo or encima else C["suave"]
+        self.texto.configure(text_color=color)
+        self.icono.configure(text_color=C["cian"] if self.activo else color)
+
+    def marcar(self, activo):
+        self.activo = activo
+        self._pintar(False)
 
 
 if __name__ == "__main__":
     ctk.set_appearance_mode("dark")
     app = ctk.CTk(fg_color=C["fondo"])
+    app.attributes("-alpha", 0.0)  # entra con un fundido (ver animar)
     app.title(f"{NOMBRE_APP} {VERSION}")
     base_recursos = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     icono = os.path.join(base_recursos, "icono.ico")
@@ -1958,127 +2551,196 @@ if __name__ == "__main__":
             app.after(300, lambda: app.iconbitmap(icono))
         except Exception:
             pass
-    app.geometry("1080x700")
-    app.minsize(980, 640)
+    if sys.platform == "win32":
+        app.after(300, barra_titulo)
+    ESCALA[0] = ctk.ScalingTracker.get_widget_scaling(app)
+    app.geometry("1180x780")
+    app.minsize(1040, 720)
 
     cfg = cargar_config()
 
-    cab = ctk.CTkFrame(app, fg_color="transparent")
-    cab.pack(fill="x", padx=24, pady=(18, 12))
-    fila_titulo = ctk.CTkFrame(cab, fg_color="transparent")
-    fila_titulo.pack(anchor="w")
+    # ── Barra lateral ──
+    lateral = ctk.CTkFrame(app, fg_color=C["lateral"], corner_radius=0, width=240)
+    lateral.pack(side="left", fill="y")
+    lateral.pack_propagate(False)
+    tk.Frame(app, width=1, bg=C["borde"]).pack(side="left", fill="y")
+
+    marca = ctk.CTkFrame(lateral, fg_color="transparent")
+    marca.pack(fill="x", padx=20, pady=(26, 0))
     logo_png = os.path.join(base_recursos, "icono.png")
     if os.path.isfile(logo_png):
         try:
             app.logo_img = tk.PhotoImage(file=logo_png)
-            tk.Label(fila_titulo, image=app.logo_img, bg=C["fondo"], bd=0).pack(side="left", padx=(0, 12))
+            tk.Label(marca, image=app.logo_img, bg=C["lateral"], bd=0).pack(side="left", padx=(0, 10))
         except Exception:
             pass
-    ctk.CTkLabel(fila_titulo, text=NOMBRE_APP, text_color=C["texto"],
-                 font=ctk.CTkFont(size=30, weight="bold")).pack(side="left")
-    ctk.CTkLabel(cab, text="Todas las misiones, todos los idiomas. Traduce los libros de misiones de tus modpacks "
-                           "protegiendo códigos y nombres de mods.",
-                 text_color=C["suave"], font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(4, 0))
+    TextoNeon(marca, NOMBRE_APP.upper(), 34, C["cian"], C["lateral"], 130, 50).pack(side="left")
+    ctk.CTkLabel(lateral, text="Traductor de misiones", text_color=C["suave"], height=16,
+                 font=ctk.CTkFont(size=12)).pack(anchor="w", padx=26)
 
-    cuerpo = ctk.CTkFrame(app, fg_color="transparent")
-    cuerpo.pack(fill="both", expand=True, padx=24, pady=(0, 20))
-    cuerpo.grid_columnconfigure(0, weight=0, minsize=440)
-    cuerpo.grid_columnconfigure(1, weight=1)
-    cuerpo.grid_rowconfigure(0, weight=1)
+    nav = ctk.CTkFrame(lateral, fg_color="transparent")
+    nav.pack(fill="x", pady=(30, 0))
+    indicador = tk.Frame(nav, bg=C["cian"], width=px(3), height=px(22))
+    contenido = ctk.CTkFrame(app, fg_color="transparent")
+    contenido.pack(side="left", fill="both", expand=True, padx=36, pady=28)
+    PAGINAS = {}
+    for clave, icono, texto in (("traducir", "▶", "Traducir"), ("motores", "◆", "Motores"),
+                                ("registro", "☰", "Registro"), ("ajustes", "⚙", "Ajustes")):
+        boton = ItemNav(nav, icono, texto, lambda c=clave: navegar(c))
+        boton.pack(fill="x", padx=14, pady=2)
+        PAGINAS[clave] = (ctk.CTkFrame(contenido, fg_color="transparent"), boton)
 
-    izq = ctk.CTkScrollableFrame(cuerpo, fg_color="transparent", width=420)
-    izq.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
-    der = ctk.CTkFrame(cuerpo, fg_color=C["tarjeta"], corner_radius=14, border_width=1, border_color=C["borde"])
-    der.grid(row=0, column=1, sticky="nsew")
+    ctk.CTkLabel(lateral, text=f"v{VERSION}", text_color=C["tenue"], height=14,
+                 font=ctk.CTkFont(size=11)).pack(side="bottom", anchor="w", padx=26, pady=(0, 18))
+    mini = ctk.CTkFrame(lateral, fg_color=C["tarjeta"], corner_radius=12, border_width=1, border_color=C["borde"])
+    mini.pack(side="bottom", fill="x", padx=14, pady=(0, 10))
+    fila_mini = ctk.CTkFrame(mini, fg_color="transparent")
+    fila_mini.pack(fill="x", padx=14, pady=(12, 8))
+    lbl_mini = ctk.CTkLabel(fila_mini, text="●  En espera", text_color=C["suave"], height=18, font=ctk.CTkFont(size=12))
+    lbl_mini.pack(side="left")
+    lbl_mini_pct = ctk.CTkLabel(fila_mini, text="0%", text_color=C["texto"], height=18,
+                                font=ctk.CTkFont(family=DISPLAY, size=13))
+    lbl_mini_pct.pack(side="right")
+    mini_barra = BarraNeon(mini, 4, C["tarjeta"])
+    mini_barra.pack(fill="x", padx=px(14), pady=(0, px(14)))
 
-    c1 = tarjeta(izq, 1, "Carpeta del modpack", "La de la instancia: donde están config, mods, kubejs...")
-    entrada_ruta = ctk.CTkEntry(c1, height=38, placeholder_text="C:/.../Instances/Mi Modpack",
-                                fg_color=C["fondo"], border_color=C["borde"])
+    # ── Página: Traducir ──
+    p = PAGINAS["traducir"][0]
+    encabezado(p, "Traducir modpack", "Elige tu modpack y el idioma. Babel protege los códigos y los nombres de los mods.")
+    c = tarjeta(p)
+    etiqueta(c, "CARPETA DEL MODPACK")
+    fila_ruta = ctk.CTkFrame(c, fg_color="transparent")
+    fila_ruta.pack(fill="x")
+    entrada_ruta = campo(fila_ruta, placeholder_text="C:/.../Instances/Mi Modpack")
     entrada_ruta.pack(side="left", fill="x", expand=True)
-    boton_suave(c1, "Examinar", elegir_carpeta, width=92, height=38).pack(side="left", padx=(8, 0))
-
-    c2 = tarjeta(izq, 2, "Idioma de destino", "Elige a qué idioma quieres traducir")
-    combo_idioma = ctk.CTkComboBox(c2, values=list(IDIOMAS.keys()), state="readonly", height=38,
-                                   fg_color=C["fondo"], border_color=C["borde"], button_color=C["borde"],
-                                   button_hover_color=C["borde_hover"], dropdown_fg_color=C["tarjeta"],
-                                   dropdown_hover_color=C["borde"])
+    entrada_ruta.bind("<KeyRelease>", validar_ruta)
+    boton_suave(fila_ruta, "Examinar", elegir_carpeta, width=100, height=40).pack(side="left", padx=(8, 0))
+    lbl_ruta = ctk.CTkLabel(c, text="", height=18, anchor="w", font=ctk.CTkFont(size=12))
+    lbl_ruta.pack(fill="x", pady=(6, 0))
+    etiqueta(c, "IDIOMA DE DESTINO", pady=(14, 8))
+    combo_idioma = ctk.CTkComboBox(c, values=list(IDIOMAS.keys()), state="readonly", height=40, corner_radius=10,
+                                   fg_color=C["campo"], border_color=C["borde"], button_color=C["boton"],
+                                   button_hover_color=C["boton_hover"], text_color=C["texto"],
+                                   dropdown_fg_color=C["tarjeta"], dropdown_hover_color=C["boton_hover"],
+                                   dropdown_text_color=C["texto"])
     combo_idioma.pack(fill="x")
     combo_idioma.set(cfg.get("idioma") if cfg.get("idioma") in IDIOMAS else "Español (México)")
-    var_instalar = tk.BooleanVar(value=cfg.get("instalar", True))
-    ctk.CTkCheckBox(c2, text="Instalar en el modpack (con copia de seguridad)", variable=var_instalar,
-                    text_color=C["suave"], fg_color=C["acento"], hover_color=C["acento_hover"],
-                    checkmark_color=C["texto_acento"], font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(12, 0))
-    var_todo = tk.BooleanVar(value=cfg.get("incluir_todo", False))
-    ctk.CTkCheckBox(c2, text="Incluir textos de otros mods (usa más cuota)", variable=var_todo,
-                    text_color=C["suave"], fg_color=C["acento"], hover_color=C["acento_hover"],
-                    checkmark_color=C["texto_acento"], font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(8, 0))
 
-    c3 = tarjeta(izq, 3, "Clave de DeepL (recomendada)", "Gratis: 500 000 caracteres al mes. Sin clave usa Microsoft y Google")
-    fila_api = ctk.CTkFrame(c3, fg_color="transparent")
+    h = tarjeta(p)
+    arriba = ctk.CTkFrame(h, fg_color="transparent")
+    arriba.pack(fill="x")
+    lbl_pct = TextoNeon(arriba, "0%", 64, C["cian"], C["tarjeta"], 230, 84)
+    lbl_pct.pack(side="left")
+    info = ctk.CTkFrame(arriba, fg_color="transparent")
+    info.pack(side="left", fill="x", expand=True, padx=(12, 0))
+    etiqueta(info, "PROGRESO", pady=(0, 4))
+    lbl_estado = ctk.CTkLabel(info, text="Listo para empezar", text_color=C["suave"], anchor="w", justify="left",
+                              wraplength=480, font=ctk.CTkFont(size=13))
+    lbl_estado.pack(fill="x")
+    fila_chips = ctk.CTkFrame(info, fg_color="transparent")
+    fila_chips.pack(fill="x", pady=(8, 0))
+    chips = {}
+    for nombre in ("DeepL", "LibreTranslate", "Microsoft", "Google"):
+        chips[nombre] = [ctk.CTkLabel(fila_chips, text=f"●  {nombre}", height=26, corner_radius=13, font=ctk.CTkFont(size=12))]
+        chips[nombre][0].pack(side="left", padx=(0, 8))
+    barra = BarraNeon(h, 10, C["tarjeta"])
+    barra.pack(fill="x", pady=(px(14), px(18)))
+    fila_stats = ctk.CTkFrame(h, fg_color="transparent")
+    fila_stats.pack(fill="x")
+    stats = {}
+    for i, (clave, nombre, color) in enumerate((("nuevas", "NUEVAS", C["cian"]), ("cache", "DE MEMORIA", C["morado"]),
+                                                 ("fallidas", "SIN TRADUCIR", C["mal"]))):
+        fila_stats.grid_columnconfigure(i, weight=1, uniform="stats")
+        caja = ctk.CTkFrame(fila_stats, fg_color=C["campo"], corner_radius=12, border_width=1, border_color=C["borde"])
+        caja.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 12, 0))
+        tk.Frame(caja, bg=color, height=px(3), width=px(28)).pack(anchor="w", padx=px(16), pady=(px(14), 0))
+        stats[clave] = ctk.CTkLabel(caja, text="0", text_color=C["texto"], height=34, font=ctk.CTkFont(family=DISPLAY, size=28))
+        stats[clave].pack(anchor="w", padx=16, pady=(6, 0))
+        ctk.CTkLabel(caja, text=nombre, text_color=C["suave"], height=16,
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=16, pady=(0, 14))
+    # la fila de botones va en el borde de la tarjeta para que el brillo quepa sin descuadrar el botón
+    acciones = ctk.CTkFrame(h.master, fg_color="transparent")
+    acciones.pack(fill="x", padx=12, pady=(0, 10))
+    btn_inicio = BotonNeon(acciones, "▶  TRADUCIR", boton_iniciar, C["tarjeta"])
+    btn_inicio.pack(side="left", fill="x", expand=True)
+    btn_stop = ctk.CTkButton(acciones, text="■  Detener", height=52, width=140, corner_radius=14, state="disabled",
+                             command=boton_detener, fg_color="transparent", border_width=1,
+                             border_color=C["borde"], text_color=C["peligro"], hover_color=C["peligro_fondo"],
+                             text_color_disabled=C["tenue"], font=ctk.CTkFont(size=14))
+    btn_stop.pack(side="left", padx=(2, 10))
+
+    # ── Página: Motores ──
+    p = PAGINAS["motores"][0]
+    encabezado(p, "Motores de traducción", "Babel reparte el trabajo entre varios motores. Si uno falla o se bloquea, "
+                                           "sigue con los demás.")
+    estados = {}
+    c = tarjeta_motor(p, "DeepL", "La mejor calidad. Gratis: 500 000 caracteres al mes con tu clave.")
+    fila_api = ctk.CTkFrame(c, fg_color="transparent")
     fila_api.pack(fill="x")
-    entrada_api = ctk.CTkEntry(fila_api, height=38, show="•", placeholder_text="Pega tu clave (termina en :fx)",
-                               fg_color=C["fondo"], border_color=C["borde"])
+    entrada_api = campo(fila_api, show="•", placeholder_text="Pega tu clave (termina en :fx)")
     entrada_api.pack(side="left", fill="x", expand=True)
-    boton_suave(fila_api, "Conseguir clave", lambda: webbrowser.open(URL_DEEPL), width=120, height=38).pack(side="left", padx=(8, 0))
+    btn_ojo = boton_suave(fila_api, "👁", alternar_clave, width=40, height=40)
+    btn_ojo.pack(side="left", padx=(8, 0))
+    boton_suave(fila_api, "Conseguir clave", lambda: webbrowser.open(URL_DEEPL), width=130, height=40).pack(side="left", padx=(8, 0))
     var_recordar = tk.BooleanVar(value=bool(cfg.get("deepl_key")))
-    ctk.CTkCheckBox(c3, text="Recordar mi clave en este equipo", variable=var_recordar, text_color=C["suave"],
-                    fg_color=C["acento"], hover_color=C["acento_hover"], checkmark_color=C["texto_acento"],
-                    font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(10, 0))
-
-    c4 = tarjeta(izq, 4, "Traductor local (opcional)", "LibreTranslate en tu PC: gratis, rápido y sin límites")
-    fila_libre = ctk.CTkFrame(c4, fg_color="transparent")
+    opcion(c, "Recordar mi clave en este equipo", var_recordar)
+    c = tarjeta_motor(p, "LibreTranslate", "Traductor local en tu PC: gratis, rápido y sin límites. Opcional.")
+    fila_libre = ctk.CTkFrame(c, fg_color="transparent")
     fila_libre.pack(fill="x")
-    entrada_libre = ctk.CTkEntry(fila_libre, height=38, placeholder_text=LIBRE_POR_DEFECTO,
-                                 fg_color=C["fondo"], border_color=C["borde"])
+    entrada_libre = campo(fila_libre, placeholder_text=LIBRE_POR_DEFECTO)
     entrada_libre.pack(side="left", fill="x", expand=True)
-    boton_suave(fila_libre, "Cómo instalarlo", lambda: webbrowser.open(URL_LIBRE), width=120, height=38).pack(side="left", padx=(8, 0))
+    boton_suave(fila_libre, "Cómo instalarlo", lambda: webbrowser.open(URL_LIBRE), width=130, height=40).pack(side="left", padx=(8, 0))
     entrada_libre.insert(0, cfg.get("libre_url") or LIBRE_POR_DEFECTO)
+    fila = ctk.CTkFrame(p, fg_color="transparent")
+    fila.pack(fill="x")
+    tarjeta_motor(fila, "Microsoft", "Gratis y sin clave.", side="left", fill="both", expand=True, padx=(0, 8), pady=0)
+    tarjeta_motor(fila, "Google", "Gratis y sin clave.", side="left", fill="both", expand=True, padx=(8, 0), pady=0)
+    for nombre in chips:
+        pintar_motor(nombre)
+
+    # ── Página: Registro ──
+    p = PAGINAS["registro"][0]
+    fila = encabezado(p, "Registro", "Todo lo que hace Babel, paso a paso.")
+    btn_copiar = ctk.CTkButton(fila, text="Copiar", width=100, height=34, corner_radius=10, command=copiar_registro,
+                               fg_color=C["boton"], hover_color=C["boton_hover"], text_color=C["suave"],
+                               font=ctk.CTkFont(size=12))
+    btn_copiar.pack(side="right")
+    txt = ctk.CTkTextbox(p, fg_color=C["consola"], text_color=C["consola_txt"], corner_radius=14, border_width=1,
+                         border_color=C["borde"], border_spacing=14, scrollbar_button_color=C["borde"],
+                         scrollbar_button_hover_color=C["borde_hover"],
+                         font=ctk.CTkFont(family="Consolas", size=13), wrap="word")
+    txt.pack(fill="both", expand=True)
+    for tag, color in (("ok", C["ok"]), ("aviso", C["aviso"]), ("error", C["mal"]), ("tenue", C["tenue"])):
+        txt.tag_config(tag, foreground=color)
+    txt.insert("end", "Elige tu modpack y pulsa Traducir. Aquí verás todo lo que va pasando.\n", "tenue")
+
+    # ── Página: Ajustes ──
+    p = PAGINAS["ajustes"][0]
+    encabezado(p, "Ajustes", "Cómo se instala la traducción y qué textos se incluyen.")
+    c = tarjeta(p)
+    var_instalar = tk.BooleanVar(value=cfg.get("instalar", True))
+    opcion_grande(c, "Instalar en el modpack", "Copia la traducción dentro del modpack y guarda una copia de seguridad "
+                                               "de los archivos originales.", var_instalar)
+    tk.Frame(c, height=1, bg=C["borde"]).pack(fill="x", pady=px(16))
+    var_todo = tk.BooleanVar(value=cfg.get("incluir_todo", False))
+    opcion_grande(c, "Incluir textos de otros mods", "Además de las misiones, traduce textos de otros mods. "
+                                                     "Usa más cuota de los traductores.", var_todo)
+    c = tarjeta(p)
+    etiqueta(c, "CARPETA DE RESULTADOS")
+    fila = ctk.CTkFrame(c, fg_color="transparent")
+    fila.pack(fill="x")
+    ruta_resultados = os.path.join(RUTA_SALIDA_FIJA, "_traducido")
+    ctk.CTkLabel(fila, text=ruta_resultados, text_color=C["texto"], anchor="w",
+                 font=ctk.CTkFont(family="Consolas", size=12)).pack(side="left", fill="x", expand=True)
+    boton_suave(fila, "📂  Abrir", lambda: abrir_carpeta(ruta_resultados), width=110, height=36).pack(side="right")
 
     if cfg.get("carpeta"):
         entrada_ruta.insert(0, cfg["carpeta"])
+        validar_ruta()
     if cfg.get("deepl_key"):
         entrada_api.insert(0, cfg["deepl_key"])
 
-    fila = ctk.CTkFrame(izq, fg_color="transparent")
-    fila.pack(fill="x", pady=(4, 0))
-    btn_inicio = ctk.CTkButton(fila, text="▶  Traducir", height=48, corner_radius=12, command=boton_iniciar,
-                               font=ctk.CTkFont(size=16, weight="bold"), fg_color=C["acento"],
-                               hover_color=C["acento_hover"], text_color=C["texto_acento"])
-    btn_inicio.pack(side="left", fill="x", expand=True)
-    btn_stop = ctk.CTkButton(fila, text="■  Detener", height=48, width=120, corner_radius=12, state="disabled",
-                             command=boton_detener, fg_color="transparent", border_width=2,
-                             border_color=C["peligro"], text_color=C["peligro"], hover_color=C["peligro_fondo"])
-    btn_stop.pack(side="left", padx=(10, 0))
-    ctk.CTkButton(izq, text="📂  Abrir carpeta de resultados", height=38, corner_radius=10,
-                  command=lambda: abrir_carpeta(os.path.join(RUTA_SALIDA_FIJA, "_traducido")),
-                  fg_color="transparent", border_width=1, border_color=C["borde"], text_color=C["suave"],
-                  hover_color=C["borde"]).pack(fill="x", pady=(10, 0))
-
-    ctk.CTkLabel(der, text="Progreso", text_color=C["texto"],
-                 font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=18, pady=(16, 2))
-    lbl_estado = ctk.CTkLabel(der, text="Listo para empezar", text_color=C["suave"], anchor="w")
-    lbl_estado.pack(fill="x", padx=18)
-    fila_barra = ctk.CTkFrame(der, fg_color="transparent")
-    fila_barra.pack(fill="x", padx=18, pady=(10, 4))
-    barra = ctk.CTkProgressBar(fila_barra, height=14, corner_radius=7, progress_color=C["acento"], fg_color=C["fondo"])
-    barra.set(0)
-    barra.pack(side="left", fill="x", expand=True)
-    lbl_pct = ctk.CTkLabel(fila_barra, text="0%", width=48, text_color=C["texto"], font=ctk.CTkFont(size=13, weight="bold"))
-    lbl_pct.pack(side="left", padx=(10, 0))
-
-    fila_chips = ctk.CTkFrame(der, fg_color="transparent")
-    fila_chips.pack(fill="x", padx=18, pady=(4, 8))
-    ctk.CTkLabel(fila_chips, text="Motores:", text_color=C["suave"], font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 8))
-    chips = {}
-    for nombre in ("DeepL", "LibreTranslate", "Microsoft", "Google"):
-        chips[nombre] = ctk.CTkLabel(fila_chips, text=f"● {nombre}", text_color=C["suave"], font=ctk.CTkFont(size=12))
-        chips[nombre].pack(side="left", padx=(0, 12))
-
-    ctk.CTkLabel(der, text="Registro", text_color=C["texto"],
-                 font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=18, pady=(4, 4))
-    txt = ctk.CTkTextbox(der, fg_color=C["consola"], text_color=C["consola_txt"], corner_radius=10,
-                         font=ctk.CTkFont(family="Consolas", size=12), wrap="word")
-    txt.pack(fill="both", expand=True, padx=18, pady=(0, 18))
-
+    navegar("traducir")
     bombear()
+    animar()
     app.mainloop()
